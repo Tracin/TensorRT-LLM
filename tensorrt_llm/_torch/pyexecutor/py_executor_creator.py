@@ -117,6 +117,10 @@ def create_py_executor(executor_config: ExecutorConfig,
 
     executor_config.max_seq_len = max_seq_len
     executor_config.max_num_tokens = model_engine.max_num_tokens
+    # vanilla attention need to use linear kv cache, not page kv cache
+    if pytorch_backend_config.attn_backend == "VANILLA":
+        executor_config.tokens_per_block = max_seq_len
+
     spec_config = model_engine.spec_config
     if not model_engine.model.model_config.is_generation:
         #NOTE: non-generation models do not have kv cache
