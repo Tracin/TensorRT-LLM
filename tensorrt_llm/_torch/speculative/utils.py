@@ -48,7 +48,9 @@ def get_spec_decoder(max_seq_len, spec_config):
 
 
 def get_num_spec_layers(spec_config):
-    if spec_config.spec_dec_mode.is_mtp():
+    if spec_config.spec_dec_mode.is_mtp_eagle():
+        return 1
+    elif spec_config.spec_dec_mode.is_mtp():
         return spec_config.num_nextn_predict_layers
     else:
         return 0
