@@ -47,6 +47,14 @@ class VanillaAttentionMetadata(AttentionMetadata):
         self.block_ids_per_seq = self.kv_cache_manager.get_batch_cache_indices(
             self.request_ids) if self.kv_cache_manager is not None else None
 
+        self.host_request_types = torch.empty(
+            (self.max_num_requests, ),
+            device='cuda',
+            dtype=torch.int,
+        )
+        self.host_request_types[:self.num_contexts].fill_(0)
+        self.host_request_types[self.num_contexts:self.num_seqs].fill_(1)
+
 
 class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
 
