@@ -1203,8 +1203,11 @@ class VanillaMLA(nn.Module):
         hidden_states: torch.Tensor,
         position_ids: Optional[torch.LongTensor],
         attn_metadata: Optional[AttentionMetadata],
+        all_reduce_params: Optional[AllReduceParams],
         **kwargs,
     ) -> torch.Tensor:
+        # Control reduce output.
+        self.wo.reduce_output = all_reduce_params.enable_allreduce
 
         if attn_metadata is None or attn_metadata.kv_cache_manager is None:
             return self.dummy_forward(hidden_states)
