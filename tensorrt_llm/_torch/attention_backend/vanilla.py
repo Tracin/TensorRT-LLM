@@ -41,19 +41,127 @@ def generate_causal_mask(batch_size: int, target_length: int,
 
 class VanillaAttentionMetadata(AttentionMetadata):
 
+    workspace: Optional[torch.Tensor] = None
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        self.prompt_lens_cuda = torch.empty(
+            (self.max_num_requests, ),
+            device='cuda',
+            dtype=torch.int,
+        )
+        self.prompt_lens_cpu = torch.empty_like(
+            self.prompt_lens_cuda,
+            device='cpu',
+            pin_memory=True,
+        )
+        self.kv_lens_cuda = torch.empty_like(self.prompt_lens_cuda)
+        self.kv_lens = torch.empty_like(self.kv_lens_cuda,
+                                        device='cpu',
+                                        pin_memory=True)
+        self.host_request_types = torch.empty_like(self.prompt_lens_cpu)
+        # For debugging, can use it to call the wrapper's plan function
+        if self.workspace is None:
+            self.workspace = torch.empty(
+                (0, ),
+                device='cuda',
+                dtype=torch.int8,
+            )
+        if self.kv_cache_manager is not None:
+            self.kv_cache_block_offsets = torch.empty(
+                [
+                    self.kv_cache_manager.num_pools, self.max_num_requests, 2,
+                    self.kv_cache_manager.max_blocks_per_seq
+                ],
+                dtype=torch.int32,
+                device='cuda',
+            )
+            self.host_kv_cache_block_offsets = torch.empty_like(
+                self.kv_cache_block_offsets,
+                device='cpu',
+                pin_memory=True,
+            )
+            self.block_ids_per_seq = None
+            self.kv_block_ids_per_seq = None
+            if self.enable_flash_mla:
+                self.block_ids_per_seq = torch.empty(
+                    [
+                        self.kv_cache_manager.max_batch_size,
+                        self.kv_cache_manager.max_blocks_per_seq
+                    ],
+                    dtype=torch.int32,
+                    device='cuda',
+                )
+                self.kv_block_ids_per_seq = torch.zeros(
+                    [
+                        self.kv_cache_manager.max_batch_size,
+                        self.kv_cache_manager.max_blocks_per_seq
+                    ],
+                    dtype=torch.int32,
+                    device='cuda',
+                )
+
     def prepare(self) -> None:
         # indices of used cache blocks for each sequence
         assert self.request_ids is not None
         self.block_ids_per_seq = self.kv_cache_manager.get_batch_cache_indices(
             self.request_ids) if self.kv_cache_manager is not None else None
 
-        self.host_request_types = torch.empty(
-            (self.max_num_requests, ),
-            device='cuda',
+        if self.kv_cache_manager is None:
+            # Convert the attention metadata to a TRT-LLM no cache attention metadata.
+            assert self.kv_cache_manager is None, "no cache attention should not have KV cache manager"
+            assert self._max_seq_len_storage is not None, "max_seq_len should be set for no cache attention"
+
+            # setting kv cache params
+            self.kv_cache_params = KVCacheParams(use_cache=False, )
+
+            # trtllm attn metadata prepare() requires this
+            self.prompt_lens = self.context_lens
+
+            # set params that are used in wrapper.plan()
+            self.kv_cache_block_offsets = None
+            self.host_kv_cache_block_offsets = None
+            self.block_ids_per_seq = None
+
+        prompt_lens = torch.tensor(
+            self.prompt_lens,
             dtype=torch.int,
+            device='cpu',
         )
+        self.prompt_lens_cpu[:self.num_seqs].copy_(prompt_lens)
+        self.prompt_lens_cuda[:self.num_seqs].copy_(
+            self.prompt_lens_cpu[:self.num_seqs], non_blocking=True)
+
+        # number of tokens in the kv cache for each sequence in the batch
+        cached_token_lens = torch.tensor(
+            self.kv_cache_params.num_cached_tokens_per_seq,
+            dtype=torch.int,
+            device='cpu',
+        ) if self.kv_cache_params.use_cache else None
+
+        if self.enable_flash_mla:
+            self.prepare_flash_mla()
+        # number of tokens needed in the kv cache for each sequence after the next pass
+        kv_lens = cached_token_lens + self.seq_lens_kv if cached_token_lens is not None else self.seq_lens_kv
+        # self.kv_lens is the valid kv cache length, while the self.kv_lens_cuda is
+        # the sequence length including the cached tokens and the input tokens.
+        self.kv_lens[:self.num_seqs].copy_(
+            kv_lens + self.kv_cache_params.num_extra_kv_tokens)
+        self.kv_lens_cuda[:self.num_seqs].copy_(
+            kv_lens[:self.num_seqs].pin_memory(), non_blocking=True)
         self.host_request_types[:self.num_contexts].fill_(0)
         self.host_request_types[self.num_contexts:self.num_seqs].fill_(1)
+
+        # kv block offsets
+        assert self.request_ids is not None
+        if self.kv_cache_manager is not None:
+            self.kv_cache_manager.impl.copy_batch_block_offsets(
+                self.host_kv_cache_block_offsets, self.request_ids)
+            self.kv_cache_block_offsets[:, :self.num_seqs].copy_(
+                self.host_kv_cache_block_offsets[:, :self.num_seqs],
+                non_blocking=True)
+            assert self.kv_lens[:self.num_seqs].max(
+            ) <= self.kv_cache_manager.max_seq_len, f"Please set max_seq_len to at least {self.kv_lens[:self.num_seqs].max()} for kv cache manager."
 
 
 class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
