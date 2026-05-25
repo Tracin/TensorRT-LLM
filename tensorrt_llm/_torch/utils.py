@@ -490,7 +490,7 @@ def tensor_to_str(x: torch.Tensor, num_elements: int = 10) -> str:
             ")")
 
 
-@maybe_compile
+# @maybe_compile
 def maybe_compiled_copy_(dst, src):
     dst.copy_(src)
 
