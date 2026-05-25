@@ -76,6 +76,16 @@ if TYPE_CHECKING:
 BlocksPerWindow = Dict[int, Tuple[
     int,
     int]]  # window_size -> (blocks_in_primary_pool, blocks_in_secondary_pool)
+FLASHINFER_FP4_MLA_ATTENTION_ENV = "TRTLLM_FLASHINFER_FP4_MLA_ATTENTION"
+
+
+def _flashinfer_fp4_mla_attention_enabled() -> bool:
+    return os.getenv(FLASHINFER_FP4_MLA_ATTENTION_ENV, "0").lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
 
 
 @dataclass
@@ -883,6 +893,7 @@ class KVCacheManager(BaseResourceManager):
             # Forward the (possibly remapped) per-pool configurations.
             # window_size values are aligned with the post-clamp sizes.
             'pool_configurations': pool_configurations_cpp,
+            'enable_mla_v_scale_pool': self._enable_mla_v_scale_pool(),
         }
 
         if self.event_buffer_max_size > 0:
@@ -1402,7 +1413,24 @@ class KVCacheManager(BaseResourceManager):
                 cache_size_per_token,
                 quant_vector_size=16,
                 scaling_factor_dtype=DataType.FP8)
+            cache_size_bytes_per_token += self._get_mla_v_scale_bytes_per_token(
+                self.num_local_layers)
         return cache_size_bytes_per_token
+
+    def _enable_mla_v_scale_pool(self) -> bool:
+        return (self.dtype == DataType.NVFP4
+                and self.kv_cache_type == CacheTypeCpp.SELFKONLY
+                and _flashinfer_fp4_mla_attention_enabled())
+
+    def _get_mla_v_scale_bytes_per_token(self, num_layers: int) -> int:
+        if not self._enable_mla_v_scale_pool():
+            return 0
+        token_scale_cols = math.ceil(self.tokens_per_block / 16)
+        # Match the C++ per-page allocation and spread it across page tokens
+        # for scheduler capacity accounting.
+        elems_per_page = (math.ceil(self.head_dim / 128) *
+                          math.ceil(token_scale_cols / 4) * 32 * 16)
+        return num_layers * math.ceil(elems_per_page / self.tokens_per_block)
 
     def calculate_max_num_blocks(self,
                                  kv_cache_config: KvCacheConfig,
@@ -1613,16 +1641,23 @@ class KVCacheManager(BaseResourceManager):
 
         pool = self.get_pool_for_layer(layer_offset)
         layer_head_dim = pool.head_dim if pool else self.head_dim
+        layer_dtype = pool.dtype if pool else self.dtype
 
         assert kv_layout in ["NHD",
                              "HND"], f"Unsupported kv_layout: {kv_layout}"
+
+        element_per_container = 1
+        if layer_dtype == DataType.NVFP4:
+            element_per_container = 2
+        effective_head_dim = layer_head_dim // element_per_container
+
         if kv_layout == "NHD":
             return result.reshape(
                 result.shape[0],
                 self.kv_factor,
                 self.tokens_per_block,
                 self.num_kv_heads_per_layer[layer_offset],
-                layer_head_dim,
+                effective_head_dim,
             )
         else:
             return result.reshape(
@@ -1630,8 +1665,85 @@ class KVCacheManager(BaseResourceManager):
                 self.kv_factor,
                 self.num_kv_heads_per_layer[layer_offset],
                 self.tokens_per_block,
-                layer_head_dim,
+                effective_head_dim,
             )
+
+    def get_block_scale_buffers(
+            self,
+            layer_idx: int,
+            kv_layout: str = "NHD") -> Optional[torch.Tensor]:
+        '''Slice the NVFP4 block-scale tensor for a specified layer.
+
+        The returned tensor uses raw uint8 storage for the FP8 E4M3 scale
+        bytes.  The logical layouts mirror ``get_buffers()`` except the last
+        dimension is ``head_dim // 16`` scale values per token.
+        '''
+        layer_offset = self.layer_offsets[layer_idx]
+        pool = self.get_pool_for_layer(layer_offset)
+        layer_head_dim = pool.head_dim if pool else self.head_dim
+        layer_dtype = pool.dtype if pool else self.dtype
+        if layer_dtype != DataType.NVFP4:
+            return None
+
+        assert kv_layout in ["NHD",
+                             "HND"], f"Unsupported kv_layout: {kv_layout}"
+
+        pool_id = int(self.kv_cache_pool_mapping[layer_offset][0].item())
+        pool_layer_idx = int(self.kv_cache_pool_mapping[layer_offset][1].item())
+        scale_pool_ptr = int(self.kv_cache_pool_pointers[pool_id][0][1].item())
+        if scale_pool_ptr == 0:
+            return None
+
+        num_layers_in_pool = int(
+            (self.kv_cache_pool_mapping[:, 0] == pool_id).sum().item())
+        num_kv_heads = self.num_kv_heads_per_layer[layer_offset]
+        scales_per_head = layer_head_dim // 16
+        block_size = self.kv_factor * self.tokens_per_block * num_kv_heads * scales_per_head
+        layer_offset_elements = pool_layer_idx * block_size
+
+        if kv_layout == "NHD":
+            shape = [
+                self.blocks_in_primary_pool,
+                self.kv_factor,
+                self.tokens_per_block,
+                num_kv_heads,
+                scales_per_head,
+            ]
+            strides = [
+                num_layers_in_pool * block_size,
+                self.tokens_per_block * num_kv_heads * scales_per_head,
+                num_kv_heads * scales_per_head,
+                scales_per_head,
+                1,
+            ]
+        else:
+            shape = [
+                self.blocks_in_primary_pool,
+                self.kv_factor,
+                num_kv_heads,
+                self.tokens_per_block,
+                scales_per_head,
+            ]
+            strides = [
+                num_layers_in_pool * block_size,
+                self.tokens_per_block * num_kv_heads * scales_per_head,
+                scales_per_head,
+                num_kv_heads * scales_per_head,
+                1,
+            ]
+
+        return convert_to_torch_tensor(
+            TensorWrapper(
+                scale_pool_ptr + layer_offset_elements,
+                torch.uint8,
+                shape,
+                strides,
+            ))
+
+    def get_mla_v_scale_pool(self) -> Optional[torch.Tensor]:
+        if not self._enable_mla_v_scale_pool():
+            return None
+        return self.impl.get_mla_v_scale_pool()
 
     def get_indexer_k_cache_pool_data(self, layer_idx: int) -> torch.Tensor:
         result = self.impl.get_indexer_k_cache_pool_data(layer_idx)
@@ -1774,6 +1886,7 @@ class KVCacheManager(BaseResourceManager):
                     layer_elements,
                     quant_vector_size=16,
                     scaling_factor_dtype=DataType.FP8)
+                layer_bytes += self._get_mla_v_scale_bytes_per_token(1)
             total_bytes += layer_bytes
         return total_bytes
 
@@ -2790,6 +2903,56 @@ class KVCacheManagerV2(BaseResourceManager):
             dtype,
             shape,
         ))
+
+    def get_block_scale_buffers(
+            self,
+            layer_idx: int,
+            kv_layout: str = "NHD") -> Optional[torch.Tensor]:
+        if self.dtype != DataType.NVFP4:
+            return None
+
+        layer_offset = self.layer_offsets[layer_idx]
+        addr_key = self.impl.get_mem_pool_base_address(layer_offset,
+                                                       Role.KEY_BLOCK_SCALE)
+        if self.kv_cache_type != CacheTypeCpp.SELFKONLY:
+            addr_value = self.impl.get_mem_pool_base_address(
+                layer_offset, Role.VALUE_BLOCK_SCALE)
+            page_size_key = self.impl.get_page_stride(layer_offset,
+                                                      Role.KEY_BLOCK_SCALE)
+            page_size_value = self.impl.get_page_stride(layer_offset,
+                                                        Role.VALUE_BLOCK_SCALE)
+
+            assert addr_key + page_size_value == addr_value and page_size_key == page_size_value
+
+        assert kv_layout in ["NHD",
+                             "HND"], f"Unsupported kv_layout: {kv_layout}"
+
+        scales_per_head = self.head_dim // 16
+        if kv_layout == "NHD":
+            shape = [
+                self.impl.get_page_index_upper_bound(layer_offset, Role.KEY) //
+                self.kv_factor,
+                self.kv_factor,
+                self.tokens_per_block,
+                self.num_kv_heads_per_layer[layer_offset],
+                scales_per_head,
+            ]
+        else:
+            shape = [
+                self.impl.get_page_index_upper_bound(layer_offset, Role.KEY) //
+                self.kv_factor,
+                self.kv_factor,
+                self.num_kv_heads_per_layer[layer_offset],
+                self.tokens_per_block,
+                scales_per_head,
+            ]
+
+        return convert_to_torch_tensor(
+            TensorWrapper(
+                addr_key,
+                torch.uint8,
+                shape,
+            ))
 
     def get_num_available_tokens(self,
                                  *,

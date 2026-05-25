@@ -2088,6 +2088,12 @@ public:
     [[nodiscard]] virtual runtime::ITensor::SharedPtr getUniquePrimaryPool() const = 0;
     [[nodiscard]] virtual runtime::ITensor::SharedPtr getPrimaryPool(SizeType32 layer_idx) const = 0;
     [[nodiscard]] virtual runtime::ITensor::SharedPtr getIndexerKCachePool() const = 0;
+
+    [[nodiscard]] virtual runtime::ITensor::SharedPtr getMlaVScalePool() const
+    {
+        return nullptr;
+    }
+
     [[nodiscard]] virtual SizeType32 getPoolLayerIdx(SizeType32 layer_idx) const = 0;
     [[nodiscard]] virtual bool isPoolLayerFirst(SizeType32 layer_idx) const = 0;
 
@@ -2226,7 +2232,7 @@ public:
         bool enableIndexerKCache = false, SizeType32 indexerKCacheQuantBlockSize = 128,
         SizeType32 indexerKCacheIndexHeadDim = 0, bool indexerKCacheUseFp4 = false,
         std::optional<LinearAttentionMetadata> linearAttentionMetadata = std::nullopt,
-        std::vector<PoolConfiguration> const& poolConfigurations = {});
+        std::vector<PoolConfiguration> const& poolConfigurations = {}, bool enableMlaVScalePool = false);
 
     KVCacheManager(std::vector<SizeType32> const& numKvHeadsPerLayer, SizeType32 sizePerHead, SizeType32 tokensPerBlock,
         BlocksPerWindow const& blocksPerWindow, SizeType32 maxNumSequences, SizeType32 maxBeamWidth,
@@ -2240,7 +2246,7 @@ public:
         bool enableIndexerKCache = false, SizeType32 indexerKCacheQuantBlockSize = 128,
         SizeType32 indexerKCacheIndexHeadDim = 0, bool indexerKCacheUseFp4 = false,
         std::optional<LinearAttentionMetadata> linearAttentionMetadata = std::nullopt,
-        std::vector<PoolConfiguration> const& poolConfigurations = {});
+        std::vector<PoolConfiguration> const& poolConfigurations = {}, bool enableMlaVScalePool = false);
 
     KVCacheManager(SizeType32 numLayers, SizeType32 numKvHeads, SizeType32 sizePerHead, SizeType32 tokensPerBlock,
         BlocksPerWindow const& blocksPerWindow, SizeType32 maxNumSequences, SizeType32 maxBeamWidth,
@@ -2254,7 +2260,7 @@ public:
         bool enableIndexerKCache = false, SizeType32 indexerKCacheQuantBlockSize = 128,
         SizeType32 indexerKCacheIndexHeadDim = 0, bool indexerKCacheUseFp4 = false,
         std::optional<LinearAttentionMetadata> linearAttentionMetadata = std::nullopt,
-        std::vector<PoolConfiguration> const& poolConfigurations = {});
+        std::vector<PoolConfiguration> const& poolConfigurations = {}, bool enableMlaVScalePool = false);
 
     KVCacheManager(SizeType32 numLayers, SizeType32 numKvHeads, SizeType32 sizePerHead, SizeType32 tokensPerBlock,
         BlocksPerWindow const& blocksPerWindow, SizeType32 maxNumSequences, SizeType32 maxBeamWidth,
@@ -2264,7 +2270,7 @@ public:
         bool enableIndexerKCache = false, SizeType32 indexerKCacheQuantBlockSize = 128,
         SizeType32 indexerKCacheIndexHeadDim = 0, bool indexerKCacheUseFp4 = false,
         std::optional<LinearAttentionMetadata> linearAttentionMetadata = std::nullopt,
-        std::vector<PoolConfiguration> const& poolConfigurations = {});
+        std::vector<PoolConfiguration> const& poolConfigurations = {}, bool enableMlaVScalePool = false);
 
     ~KVCacheManager() override = default;
 
@@ -2537,6 +2543,11 @@ public:
     runtime::ITensor::SharedPtr getPrimaryPool(SizeType32 layer_idx) const override;
     runtime::ITensor::SharedPtr getIndexerKCachePool() const override;
 
+    runtime::ITensor::SharedPtr getMlaVScalePool() const override
+    {
+        return mMlaVScalePool;
+    }
+
     SizeType32 getPoolLayerIdx(SizeType32 layer_idx) const override
     {
         return mBlockManager.getPoolLayerIdx(layer_idx);
@@ -2606,6 +2617,8 @@ private:
     SizeType32 mMaxAttentionWindow;
     // Number of tokens per block
     SizeType32 mTokensPerBlock;
+    // Size of each attention head before FP4 packing.
+    SizeType32 mSizePerHead;
     // Number of tokens to fill up the sink tokens to a full block size
     SizeType32 mSinkBubbleLength;
     // Number of tokens in the sink blocks
@@ -2618,6 +2631,7 @@ private:
     std::unordered_map<LlmRequest::RequestIdType, GenerationRequest> mSequences;
     // Whether to cache KV pages for reuse
     bool mEnableBlockReuse;
+    bool mEnableMlaVScalePool;
     // Mutex to protect access to mSequences
     mutable std::mutex mSequencesMtx;
     // buffers for static tensors, will be created after allocating pools
@@ -2625,6 +2639,7 @@ private:
     runtime::ITensor::SharedPtr mLayerToPoolMapping;
     runtime::ITensor::SharedPtr mBlockScalePoolPointers;
     runtime::ITensor::SharedPtr mIndexerKCachePoolPointers;
+    runtime::ITensor::SharedPtr mMlaVScalePool;
     // GPU bytes allocated for KV-cache
     std::size_t mAllocatedBytes{0};
 };
