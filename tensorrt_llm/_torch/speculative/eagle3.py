@@ -18,7 +18,8 @@ from ..pyexecutor.resource_manager import BaseResourceManager, SlotManager
 from ..pyexecutor.sampler import TorchSampler
 from ..pyexecutor.scheduler import ScheduledRequests
 from .interface import SpecMetadata, SpecWorkerBase
-from .mtp import MTPSampler, _select_mtp_position_ids
+from .mtp import (MTPSampler, _repair_fp4_mla_hp_kv_after_mtp_acceptance,
+                  _select_mtp_position_ids)
 from .sa_enhancer import SADraftEnhancer
 from .spec_tree_manager import SpecTreeManager
 
@@ -675,6 +676,8 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         # acceptance path (scans for thinking-phase tokens); ignored otherwise.
         accepted_tokens, num_accepted_tokens = self.sample_and_accept_draft_tokens(
             input_ids, logits, attn_metadata, spec_metadata)
+        _repair_fp4_mla_hp_kv_after_mtp_acceptance(attn_metadata,
+                                                   num_accepted_tokens)
 
         # Mamba hybrid models need state updates after token acceptance because
         # the accepted token count affects which Mamba states are valid. The
@@ -862,22 +865,34 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                                                                 d2t,
                                                                 draft_step=i)
 
-                # When ADP+LM-head-TP pads logits to max_num_requests, the
-                # padded rows are zero-filled placeholders only required so
-                # every TP rank produces logits of identical shape for the
-                # LM-head-TP all-gather. Drop them *before* sampling: the
-                # per-request sampling params (temperatures/top_k/top_p) are
-                # sized to token_count (== batch_size), so the padded logits
-                # would otherwise fail to broadcast in apply_temperature. This
-                # also keeps next_draft_tokens and the draft_probs buffer
-                # token_count-sized without a post-hoc trim.
-                if use_lm_head_tp_in_adp:
-                    logits = logits[:token_count]
-                new_draft_token = self.draft_decoder(logits,
-                                                     draft_model,
-                                                     spec_metadata,
-                                                     batch_size,
-                                                     draft_step=i)
+                # Sample the next draft token.
+                # MTP Eagle: TP-aware sampler; when ADP+LM-head-TP is active
+                #   logits are padded to max_num_requests across TP ranks, so
+                #   the result must be trimmed back to token_count.
+                # Eagle3: simple greedy sampling; d2t remaps vocab indices when
+                #   the draft model uses a compressed vocabulary.
+                if self.is_mtp_eagle:
+                    if use_lm_head_tp_in_adp:
+                        mapping_lm_head_tp = draft_model.mtp_layers[
+                            0].shared_head.mapping_lm_head_tp
+                        draft_logits = logits[:token_count]
+                        new_draft_token = self.draft_sampler(
+                            logits, mapping_lm_head_tp)
+                        new_draft_token = new_draft_token[:token_count]
+                    else:
+                        draft_logits = logits
+                        new_draft_token = self.draft_sampler(logits)
+                else:
+                    if use_lm_head_tp_in_adp:
+                        logits = logits[:token_count]
+                    new_draft_token = self.draft_decoder(logits,
+                                                         draft_model,
+                                                         spec_metadata,
+                                                         batch_size,
+                                                         draft_step=i)
+
+                if self.is_mtp_eagle and spec_metadata.use_rejection_sampling:
+                    draft_logits_list.append(draft_logits.clone())
                 next_draft_tokens.append(new_draft_token)
 
                 # Update hidden states for the next iteration.
@@ -900,19 +915,32 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                     has_kv_cache = inputs[
                         "attn_metadata"].kv_cache_manager is not None
                     if has_kv_cache:
-                        attn_metadata.host_request_types[:attn_metadata.
-                                                         num_contexts].fill_(1)
+                        host_request_types = getattr(attn_metadata,
+                                                     "host_request_types", None)
+                        if host_request_types is not None:
+                            host_request_types[:attn_metadata.
+                                               num_contexts].fill_(1)
                         attn_metadata.num_contexts = 0
+                    kv_lens_updated = False
                     if hasattr(attn_metadata, 'kv_lens_cuda'):
                         attn_metadata.kv_lens_cuda[num_contexts:batch_size] -= (
                             runtime_draft_len -
                             num_accepted_tokens[num_contexts:])
                         attn_metadata.kv_lens_cuda[:num_contexts] += 1
+                        kv_lens_updated = True
+                    elif getattr(attn_metadata, "kv_lens_cuda_runtime",
+                                 None) is not None:
+                        attn_metadata.kv_lens_cuda_runtime[
+                            num_contexts:batch_size] -= (
+                                runtime_draft_len -
+                                num_accepted_tokens[num_contexts:])
+                        attn_metadata.kv_lens_cuda_runtime[:num_contexts] += 1
+                        kv_lens_updated = True
 
                     if has_kv_cache:
                         self._prepare_flash_mla_generation_layout(
                             attn_metadata, num_contexts, batch_size)
-                    if hasattr(attn_metadata, 'kv_lens_cuda'):
+                    if kv_lens_updated:
                         attn_metadata.update_for_spec_dec()
 
                     # Both Eagle3 and MTP Eagle drafters take ``draft_len + 1``
@@ -924,6 +952,10 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                 else:
                     if hasattr(attn_metadata, 'kv_lens_cuda'):
                         attn_metadata.kv_lens_cuda[:batch_size] += 1
+                        attn_metadata.update_for_spec_dec()
+                    elif getattr(attn_metadata, "kv_lens_cuda_runtime",
+                                 None) is not None:
+                        attn_metadata.kv_lens_cuda_runtime[:batch_size] += 1
                         attn_metadata.update_for_spec_dec()
 
                 inputs = {
@@ -948,7 +980,7 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         # batches only). All-greedy batches skip storage — rejection sampling
         # will be bypassed by _can_use_rejection_sampling. Finalize the validity
         # flag and d2t for next-iter target-side verification.
-        if spec_metadata.use_rejection_sampling:
+        if spec_metadata.use_rejection_sampling and not self.is_mtp_eagle:
             if not spec_metadata.is_all_greedy_sample:
                 d2t_param = getattr(getattr(draft_model, 'model', None), "d2t",
                                     None)
@@ -956,6 +988,14 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                 spec_metadata.draft_probs_valid = True
             else:
                 spec_metadata.draft_probs_valid = False
+        elif spec_metadata.use_rejection_sampling and draft_logits_list:
+            if self.is_mtp_eagle:
+                spec_metadata.d2t = None
+            else:
+                d2t_param = getattr(draft_model.model, "d2t", None)
+                spec_metadata.d2t = d2t_param.data if d2t_param is not None else None
+            self._compute_and_store_draft_probs(draft_logits_list,
+                                                spec_metadata, batch_size)
 
         return next_draft_tokens
 
@@ -1009,7 +1049,7 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         attn_metadata.block_ids_per_seq[:batch_size, :].copy_(
             reorder_block_ids_per_seq, non_blocking=True)
 
-    @torch.compile(options={"max-autotune": True})
+    # @torch.compile(options={"max-autotune": True})
     def _get_local_max_and_combined(self, logits, mapping_lm_tp=None):
         local_max_values, local_argmax = torch.max(logits, dim=-1, keepdim=True)
         vocab_per_rank = logits.shape[-1]
@@ -1024,7 +1064,7 @@ class Eagle3OneModelWorker(SpecWorkerBase):
             dim=-1).flatten(-2)
         return combined
 
-    @torch.compile(options={"max-autotune": True})
+    # @torch.compile(options={"max-autotune": True})
     def _get_draft_tokens_from_gathered(self, gathered):
         gathered_indices_float = gathered[..., 0::2]
         gathered_values_float = gathered[..., 1::2]
@@ -1066,7 +1106,7 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         else:
             return self._draft_sampler_greedy(logits)
 
-    @torch.compile(options={"max-autotune": True})
+    # @torch.compile(options={"max-autotune": True})
     def _topk_kernel(self, gen_logprobs, num_gens, mtp_num_modules,
                      spec_metadata):
         topk_value, topk_indices = torch.topk(gen_logprobs,
@@ -1080,7 +1120,7 @@ class Eagle3OneModelWorker(SpecWorkerBase):
             num_gens, mtp_num_modules)
         return topk_value, topk_indices, draft_tokens
 
-    @torch.compile(options={"max-autotune": True})
+    # @torch.compile(options={"max-autotune": True})
     def _process_generation_logits(self, logits, num_contexts):
         gen_logits = logits[num_contexts:]
         gen_logprobs = torch.softmax(gen_logits, dim=-1)
