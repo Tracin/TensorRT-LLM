@@ -27,6 +27,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
     from cutlass.cute.runtime import from_dlpack
     from cutlass.cutlass_dsl import T, dsl_user_op
 
+    from ..cute_dsl_kernels.blackwell.utils import make_ptr
+
     class _CUDAGraphCompatibleWrapper:
         """Wrapper to make DLPack export safe during CUDA graph capture."""
 
@@ -273,6 +275,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             sm_scale: cutlass.Float32,
             stream: cuda.CUstream,
         ) -> None:
+            kv_cache_tensor = cute.make_tensor(kv_cache, cute.make_layout((1,)))
             num_head_blocks = cute.ceil_div(self.num_heads, self.head_tile)
             self._page_stats_pack_kernel(
                 page_max,
@@ -281,7 +284,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 p_sf,
                 q_fp4,
                 q_sf,
-                kv_cache,
+                kv_cache_tensor,
                 sf_cache,
                 global_scale,
                 src_page_ids,
@@ -322,7 +325,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 output,
                 p_fp4,
                 p_sf,
-                kv_cache,
+                kv_cache_tensor,
                 v_sf,
                 global_scale,
                 src_page_ids,
@@ -353,10 +356,13 @@ if IS_CUTLASS_DSL_AVAILABLE:
             sm_scale,
         ):
             physical_page = src_page_ids[compact_page]
+            physical_page_i64 = cutlass.Int64(physical_page)
             score = cutlass.Float32(0.0)
             bytes_per_group: cutlass.Constexpr = self.fp4_block // 2
             q_row_base = q_row * self.q_fp4_stride0
-            kv_token_base = physical_page * self.kv_stride0 + token_idx * self.kv_stride2
+            kv_token_base = (
+                physical_page_i64 * self.kv_stride0 + cutlass.Int64(token_idx) * self.kv_stride2
+            )
             k_sf_page_base = physical_page * self.sf_stride0
 
             # Keep q_group as a runtime loop (44 iters): unrolling it together
@@ -600,10 +606,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     if page_start < kv_len:
                         compact_page = page_table_start + page_rel
                         physical_page = src_page_ids[compact_page]
+                        physical_page_i64 = cutlass.Int64(physical_page)
                         p_row = compact_page * self.num_heads + head_idx
                         p_row_base = p_row * self.p_stride0
                         v_page_base = (
-                            physical_page * self.kv_stride0 + v_packed_col * self.kv_stride4
+                            physical_page_i64 * self.kv_stride0
+                            + cutlass.Int64(v_packed_col) * self.kv_stride4
                         )
                         v_sf_page_base = physical_page * self.v_sf_stride0
                         # Process 16 tokens at a time — both scales are
@@ -661,6 +669,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     acc / (global_scale[0] * self.p_global_scale)
                 ).to(output.element_type)
 
+    _KERNEL_ABI_VERSION = 1
     _COMPILE_CACHE: dict[tuple[int, ...], object] = {}
 
     def _storage_span(tensor: torch.Tensor) -> int:
@@ -677,6 +686,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
             stride=(1,),
             storage_offset=tensor.storage_offset(),
         )
+
+    def _to_cute_uint8_ptr(tensor: torch.Tensor) -> cute.Pointer:
+        return make_ptr(cutlass.Uint8, tensor.data_ptr(), assumed_align=16)
 
     def run_fp4_mla_attention_decode_cute(
         *,
@@ -707,7 +719,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
         q_fp4_flat = _flatten(q_fp4.view(torch.uint8))
         q_sf_flat = _flatten(q_sf.view(torch.uint8))
-        kv_cache_flat = _flatten(kv_cache.view(torch.uint8))
+        kv_cache_ptr = _to_cute_uint8_ptr(kv_cache.view(torch.uint8))
         sf_cache_flat = _flatten(sf_cache.view(torch.uint8))
         v_sf_flat = _flatten(v_sf.view(torch.uint8))
         p_fp4_flat = _flatten(p_fp4.view(torch.uint8))
@@ -728,7 +740,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             _to_cute(p_sf_flat),
             _to_cute(q_fp4_flat),
             _to_cute(q_sf_flat),
-            _to_cute(kv_cache_flat),
+            kv_cache_ptr,
             _to_cute(sf_cache_flat),
             _to_cute(v_sf_flat),
             _to_cute(global_scale),
@@ -739,6 +751,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             stream,
         )
         compile_key = (
+            _KERNEL_ABI_VERSION,
             output.device.index or 0,
             output.dtype is torch.bfloat16,
             output.shape[0],
