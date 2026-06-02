@@ -221,7 +221,7 @@ def run_one(batch, seq, heads, backend, q_len=1):
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--batch", type=int, default=None)
-    p.add_argument("--seq", type=int, default=32768)
+    p.add_argument("--seq", type=int, default=30080)
     p.add_argument("--heads", type=int, default=128)
     p.add_argument(
         "--q-len",
