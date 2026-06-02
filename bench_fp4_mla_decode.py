@@ -263,7 +263,7 @@ def main():
     )
     args = p.parse_args()
 
-    batches = [args.batch] if args.batch else [16, 32, 64, 128, 256]
+    batches = [args.batch] if args.batch else [16, 30, 60, 120, 200, 300]
     if args.backend:
         backends = [args.backend]
     else:

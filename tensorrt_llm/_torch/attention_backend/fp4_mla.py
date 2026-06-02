@@ -1600,10 +1600,6 @@ def _run_triton_attention_decode(
         **launch_meta,
     )
 
-    # tl.arange in the reduce-stats kernel requires a power-of-2 length, so we
-    # pad MAX_PAGES_POW2 up to the next power of 2 and mask the OOB rows
-    # inside the kernel using the actual `num_pages` runtime arg.
-    max_pages_pow2 = 1 if max_pages <= 1 else 1 << (max_pages - 1).bit_length()
     _attn_reduce_stats_kernel[(num_queries, num_head_blocks)](
         max_scores,
         denom,
@@ -1614,7 +1610,7 @@ def _run_triton_attention_decode(
         page_max.stride(0),
         page_max.stride(1),
         NUM_HEADS=num_heads,
-        MAX_PAGES_POW2=max_pages_pow2,
+        MAX_PAGES=max_pages,
         BLOCK_H=block_h,
         **launch_meta,
     )

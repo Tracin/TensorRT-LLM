@@ -692,7 +692,7 @@ def _fp4_mla_attention_page_stats_kernel(
             p_rows = p_page * NUM_HEADS + offs_h
             safe_p_rows = (
                 p_rows if ASSUME_FULL_HEADS else tl.where(mask_h, p_rows, p_page * NUM_HEADS)
-            )
+            ).to(tl.int64)
             scale_cols = tl.arange(0, SF_PER_PAGE)
             if ASSUME_FULL_HEADS and ASSUME_VALID_PAGES and NUM_HEADS == 128 and BLOCK_H == 128:
                 sf_offsets = _fp4_mla_swizzled_sf_offset_row_block(
@@ -767,21 +767,15 @@ def _fp4_mla_attention_reduce_stats_kernel(
     page_stats_s0,
     page_stats_s1,
     NUM_HEADS: tl.constexpr,
-    MAX_PAGES_POW2: tl.constexpr,
+    MAX_PAGES: tl.constexpr,
     BLOCK_H: tl.constexpr,
     occupancy: tl.constexpr = 1,
 ):
     """Combine per-page max/sum into a global max + denom per (query, head).
 
-    Loads all pages of (page_max, page_sum) for the assigned head block in a
-    single bulk 2D load (each thread reads one head row across all pages),
-    then performs the online-softmax reduce in registers. This converts what
-    used to be a 256-iteration latency-serial loop (ncu: long_scoreboard=32.7
-    cycles avg, 0% L1 hit) into one parallel load + one register-domain reduce.
-
-    ``tl.arange`` requires a power-of-2 length, so ``MAX_PAGES_POW2`` is the
-    next power of 2 >= actual ``num_pages``; the extra rows are masked off
-    with ``-inf`` / ``0.0`` sentinels so they don't affect the reduce.
+    Keep the page dimension in a loop instead of a 2D [pages, heads] vector.
+    Large decode batches can push max pages above 256, where the bulk vector
+    form becomes too large for a single Triton program.
     """
     gen_idx = tl.program_id(0)
     head_block = tl.program_id(1)
@@ -789,20 +783,26 @@ def _fp4_mla_attention_reduce_stats_kernel(
     mask_h = offs_h < NUM_HEADS
     safe_offs_h = tl.where(mask_h, offs_h, 0)
 
-    page_offs = tl.arange(0, MAX_PAGES_POW2)
-    mask_p = page_offs < num_pages
-    base = gen_idx * page_stats_s0 + page_offs[:, None] * page_stats_s1 + safe_offs_h[None, :]
-    # Shape: [MAX_PAGES_POW2, BLOCK_H]. Mask both head columns and OOB page rows.
-    load_mask = mask_h[None, :] & mask_p[:, None]
-    page_max_block = tl.load(page_max_ptr + base, mask=load_mask, other=-float("inf"))
-    page_sum_block = tl.load(page_sum_ptr + base, mask=load_mask, other=0.0)
+    max_score = tl.full((BLOCK_H,), -float("inf"), tl.float32)
+    for page_idx in tl.range(0, MAX_PAGES):
+        page_valid = page_idx < num_pages
+        page_offsets = gen_idx * page_stats_s0 + page_idx * page_stats_s1 + safe_offs_h
+        page_max = tl.load(
+            page_max_ptr + page_offsets, mask=mask_h & page_valid, other=-float("inf")
+        )
+        max_score = tl.maximum(max_score, page_max)
 
-    # Global max across pages, then exp + sum the corrected weights.
-    max_score = tl.max(page_max_block, axis=0)
     safe_max = tl.where(max_score > -float("inf"), max_score, 0.0)
-    weights = tl.math.exp2((page_max_block - safe_max[None, :]) * _LOG2_E)
-    weights = tl.where(page_sum_block > 0.0, page_sum_block * weights, 0.0)
-    denom = tl.sum(weights, axis=0)
+    denom = tl.zeros((BLOCK_H,), tl.float32)
+    for page_idx in tl.range(0, MAX_PAGES):
+        page_valid = page_idx < num_pages
+        page_offsets = gen_idx * page_stats_s0 + page_idx * page_stats_s1 + safe_offs_h
+        page_max = tl.load(
+            page_max_ptr + page_offsets, mask=mask_h & page_valid, other=-float("inf")
+        )
+        page_sum = tl.load(page_sum_ptr + page_offsets, mask=mask_h & page_valid, other=0.0)
+        weights = tl.math.exp2((page_max - safe_max) * _LOG2_E)
+        denom += tl.where(page_sum > 0.0, page_sum * weights, 0.0)
 
     tl.store(max_ptr + gen_idx * stats_s0 + safe_offs_h, max_score, mask=mask_h)
     tl.store(denom_ptr + gen_idx * stats_s0 + safe_offs_h, denom, mask=mask_h)
@@ -871,7 +871,9 @@ def _fp4_mla_attention_prob_scale_kernel(
 
     p_page = query_idx * MAX_PAGES + page_rel
     p_rows = p_page * NUM_HEADS + offs_h
-    safe_p_rows = p_rows if ASSUME_FULL_HEADS else tl.where(mask_h, p_rows, p_page * NUM_HEADS)
+    safe_p_rows = (
+        p_rows if ASSUME_FULL_HEADS else tl.where(mask_h, p_rows, p_page * NUM_HEADS)
+    ).to(tl.int64)
     scale_cols = tl.arange(0, SF_PER_PAGE)
     if ASSUME_FULL_HEADS and ASSUME_VALID_PAGES and NUM_HEADS == 128 and BLOCK_H == 128:
         sf_offsets = _fp4_mla_swizzled_sf_offset_row_block(
@@ -1047,7 +1049,7 @@ def _fp4_mla_attention_pv_kernel(
             p_rows = p_page * NUM_HEADS + offs_h
             safe_p_rows = (
                 p_rows if ASSUME_FULL_HEADS else tl.where(mask_h, p_rows, p_page * NUM_HEADS)
-            )
+            ).to(tl.int64)
             if USE_TMA_P_LOAD:
                 p_vals = p_desc.load([(p_page * NUM_HEADS + head_block * BLOCK_H).to(tl.int32), 0])
             else:
