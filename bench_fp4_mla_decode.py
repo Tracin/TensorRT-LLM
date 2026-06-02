@@ -60,7 +60,7 @@ PAGE_SIZE = 128
 
 
 def _seq_lens_for_batch(batch, seq):
-    return [seq + 128 * (batch_idx // 10) for batch_idx in range(batch)]
+    return [seq] * batch
 
 
 def _seq_label(seq_lens):

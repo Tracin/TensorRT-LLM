@@ -1331,6 +1331,30 @@ def _infer_cutile_assume_full_pages(metadata: Any, max_pages: int, page_size: in
 
     start = metadata.num_contexts
     end = metadata.num_seqs
+    block_counts = _host_int_list(getattr(metadata, "num_blocks", None), start, end)
+    if block_counts is not None and (
+        not block_counts or min(block_counts) != max_pages or max(block_counts) != max_pages
+    ):
+        return False
+
+    kv_lens_cuda = getattr(metadata, "kv_lens_cuda_runtime", None)
+    if isinstance(kv_lens_cuda, torch.Tensor):
+        cache_key = (
+            start,
+            end,
+            max_pages,
+            page_size,
+            tuple(block_counts) if block_counts is not None else None,
+            kv_lens_cuda.data_ptr(),
+        )
+        cache = getattr(metadata, "_fp4_mla_cutile_full_pages_cache", None)
+        if cache is not None and cache[0] == cache_key:
+            return bool(cache[1])
+        kv_lens = [int(item) for item in kv_lens_cuda[start:end].detach().cpu().tolist()]
+        result = bool(kv_lens) and min(kv_lens) == max(kv_lens) == max_pages * page_size
+        setattr(metadata, "_fp4_mla_cutile_full_pages_cache", (cache_key, result))
+        return result
+
     kv_cache_params = getattr(metadata, "kv_cache_params", None)
     cached_token_lens = _host_int_list(
         getattr(kv_cache_params, "num_cached_tokens_per_seq", None),
