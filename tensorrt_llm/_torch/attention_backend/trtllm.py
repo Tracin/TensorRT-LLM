@@ -22,7 +22,7 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from ..utils import (compute_swizzled_sf_shape, get_global_attrs,
                      get_model_extra_attrs)
-from .fp4_mla_kv import HP_BLOCK_SIZE, update_hp_kv_for_fp4_mla
+from .fp4_mla import HP_BLOCK_SIZE, update_hp_kv_for_fp4_mla
 from .interface import (AttentionBackend, AttentionForwardArgs,
                         AttentionInputType, AttentionMask, AttentionMetadata,
                         KVCacheParams, MLAParams, PositionalEmbeddingParams,
@@ -1594,7 +1594,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         attention_input_type: AttentionInputType = AttentionInputType.mixed,
     ) -> None:
         """Thin wrapper over the shared HP-pool update helper (see
-        ``fp4_mla_kv.update_hp_kv_for_fp4_mla`` for the full contract)."""
+        ``fp4_mla.update_hp_kv_for_fp4_mla`` for the full contract)."""
         if attention_input_type == AttentionInputType.context_only:
             phase = "context"
         elif attention_input_type == AttentionInputType.generation_only:

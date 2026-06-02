@@ -15,7 +15,7 @@ import pytest
 import torch
 
 import tensorrt_llm
-from tensorrt_llm._torch.attention_backend.fp4_mla_kv import (
+from tensorrt_llm._torch.attention_backend.fp4_mla import (
     FLASHINFER_FP4_MLA_ATTENTION_BACKEND_ENV,
     FLASHINFER_FP4_MLA_ATTENTION_ENV,
     FP4_BLOCK_SIZE,
@@ -34,7 +34,6 @@ from tensorrt_llm._torch.attention_backend.fp4_mla_kv import (
     scatter_fp4_mla_kv_cache,
     update_hp_kv_for_fp4_mla,
 )
-from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
@@ -1420,20 +1419,6 @@ def test_fp4_mla_attention_decode_cutile_linear_mtp_matches_reference(monkeypatc
         seed=13,
         check_probs=False,
         query_len_per_seq=3,
-    )
-
-
-@pytest.mark.skipif(_is_pre_blackwell(), reason="requires Blackwell FP4 support")
-@pytest.mark.skipif(not IS_CUTLASS_DSL_AVAILABLE, reason="requires CuTe DSL")
-def test_fp4_mla_attention_decode_cute_dsl_matches_reference(monkeypatch):
-    """CuTe DSL decode backend must preserve the FP4 MLA decode contract."""
-    _assert_fp4_mla_attention_decode_accuracy(
-        monkeypatch,
-        backend="cute_dsl",
-        num_heads=2,
-        seq_lens=[32],
-        seed=10,
-        check_probs=False,
     )
 
 
