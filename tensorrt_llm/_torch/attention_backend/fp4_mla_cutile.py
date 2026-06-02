@@ -2739,7 +2739,6 @@ def fp4_mla_paged_attention_internal(
     num_head_blocks = triton.cdiv(num_heads, block_h)
     assume_full_heads = num_heads % block_h == 0
     assume_full_v = v_head_dim % block_v == 0
-    assume_full_pages = True
     if assume_full_pages is None:
         assume_full_pages = False
     assume_full_pages = bool(assume_full_pages)
