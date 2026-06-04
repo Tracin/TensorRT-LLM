@@ -869,7 +869,10 @@ def scatter_fp4_mla_kv_cache(
         if phase == "context":
             v_pack_page_ids = metadata.paged_kv_indices
         else:
-            v_pack_page_ids = metadata.paged_kv_indices[metadata.num_context_blocks :]
+            num_gen_blocks = metadata.num_generation_blocks
+            v_pack_page_ids = metadata.paged_kv_indices[
+                metadata.num_context_blocks : metadata.num_context_blocks + num_gen_blocks
+            ]
         _maybe_update_cutile_v_packed_cache(
             metadata,
             layer_idx,
@@ -877,6 +880,8 @@ def scatter_fp4_mla_kv_cache(
             v_pack_page_ids,
             v_head_dim=v_head_dim,
             page_size=metadata.page_size,
+            local_layer=local_layer,
+            v_sf=v_sf[local_layer],
         )
         return
 
@@ -1222,12 +1227,27 @@ def _cutile_persistent_v_pack_enabled() -> bool:
     )
 
 
+def _cutile_shared_v_pack_storage_enabled() -> bool:
+    return os.getenv("TRTLLM_FP4_MLA_SHARE_V_PACK_STORAGE", "1").lower() not in (
+        "0",
+        "false",
+        "no",
+        "off",
+    )
+
+
 def _cutile_v_packed_attr(layer_idx: int) -> str:
+    if _cutile_shared_v_pack_storage_enabled():
+        return "_fp4_mla_attention_v_packed_buf"
     return f"_fp4_mla_attention_v_packed_buf_l{layer_idx}"
 
 
 def _cutile_v_packed_valid_attr(layer_idx: int) -> str:
     return f"_fp4_mla_attention_v_packed_valid_l{layer_idx}"
+
+
+def _cutile_shared_v_packed_valid_attr() -> str:
+    return "_fp4_mla_attention_v_packed_valid_tag"
 
 
 def _cutile_v_packed_shape(
@@ -1239,6 +1259,111 @@ def _cutile_v_packed_shape(
     return (kv_cache.shape[0] * _ceil_div(v_head_dim, block_v) * block_v, page_size // 2)
 
 
+def _cutile_v_packed_cache_tag(
+    layer_idx: int,
+    kv_cache: torch.Tensor,
+    *,
+    v_head_dim: int,
+    page_size: int,
+    local_layer: Optional[int] = None,
+    v_sf: Optional[torch.Tensor] = None,
+    page_ids: Optional[torch.Tensor] = None,
+) -> tuple[Any, ...]:
+    v_sf_tag = (
+        None
+        if v_sf is None
+        else (
+            int(v_sf.data_ptr()),
+            str(v_sf.device),
+            str(v_sf.dtype),
+            tuple(int(dim) for dim in v_sf.shape),
+            tuple(int(stride) for stride in v_sf.stride()),
+        )
+    )
+    page_ids_tag = (
+        None
+        if page_ids is None
+        else (
+            int(page_ids.data_ptr()),
+            str(page_ids.device),
+            str(page_ids.dtype),
+            tuple(int(dim) for dim in page_ids.shape),
+            tuple(int(stride) for stride in page_ids.stride()),
+        )
+    )
+    return (
+        int(layer_idx),
+        None if local_layer is None else int(local_layer),
+        int(kv_cache.data_ptr()),
+        str(kv_cache.device),
+        str(kv_cache.dtype),
+        tuple(int(dim) for dim in kv_cache.shape),
+        tuple(int(stride) for stride in kv_cache.stride()),
+        int(v_head_dim),
+        int(page_size),
+        v_sf_tag,
+        page_ids_tag,
+    )
+
+
+def _set_cutile_v_packed_cache_valid(
+    metadata: Any,
+    layer_idx: int,
+    kv_cache: torch.Tensor,
+    *,
+    v_head_dim: int,
+    page_size: int,
+    local_layer: Optional[int] = None,
+    v_sf: Optional[torch.Tensor] = None,
+    page_ids: Optional[torch.Tensor] = None,
+) -> None:
+    valid_attr = (
+        _cutile_shared_v_packed_valid_attr()
+        if _cutile_shared_v_pack_storage_enabled()
+        else _cutile_v_packed_valid_attr(layer_idx)
+    )
+    setattr(
+        metadata,
+        valid_attr,
+        _cutile_v_packed_cache_tag(
+            layer_idx,
+            kv_cache,
+            v_head_dim=v_head_dim,
+            page_size=page_size,
+            local_layer=local_layer,
+            v_sf=v_sf,
+            page_ids=page_ids,
+        ),
+    )
+
+
+def _is_cutile_v_packed_cache_valid(
+    metadata: Any,
+    layer_idx: int,
+    kv_cache: torch.Tensor,
+    *,
+    v_head_dim: int,
+    page_size: int,
+    local_layer: Optional[int] = None,
+    v_sf: Optional[torch.Tensor] = None,
+    page_ids: Optional[torch.Tensor] = None,
+) -> bool:
+    valid_attr = (
+        _cutile_shared_v_packed_valid_attr()
+        if _cutile_shared_v_pack_storage_enabled()
+        else _cutile_v_packed_valid_attr(layer_idx)
+    )
+    return getattr(metadata, valid_attr, None) == _cutile_v_packed_cache_tag(
+        layer_idx,
+        kv_cache,
+        v_head_dim=v_head_dim,
+        page_size=page_size,
+        local_layer=local_layer,
+        v_sf=v_sf,
+        page_ids=page_ids,
+    )
+
+
 def _maybe_update_cutile_v_packed_cache(
     metadata: Any,
     layer_idx: int,
@@ -1247,6 +1372,8 @@ def _maybe_update_cutile_v_packed_cache(
     *,
     v_head_dim: int,
     page_size: int,
+    local_layer: Optional[int] = None,
+    v_sf: Optional[torch.Tensor] = None,
 ) -> None:
     if not _cutile_persistent_v_pack_enabled():
         return
@@ -1273,7 +1400,16 @@ def _maybe_update_cutile_v_packed_cache(
         page_size=page_size,
         block_v=128,
     )
-    setattr(metadata, _cutile_v_packed_valid_attr(layer_idx), True)
+    _set_cutile_v_packed_cache_valid(
+        metadata,
+        layer_idx,
+        kv_cache,
+        v_head_dim=v_head_dim,
+        page_size=page_size,
+        local_layer=local_layer,
+        v_sf=v_sf,
+        page_ids=page_ids,
+    )
 
 
 def _get_cutile_v_packed_cache(
@@ -1283,10 +1419,22 @@ def _get_cutile_v_packed_cache(
     *,
     v_head_dim: int,
     page_size: int,
+    local_layer: Optional[int] = None,
+    v_sf: Optional[torch.Tensor] = None,
+    page_ids: Optional[torch.Tensor] = None,
 ) -> Optional[torch.Tensor]:
     if not _cutile_persistent_v_pack_enabled():
         return None
-    if not bool(getattr(metadata, _cutile_v_packed_valid_attr(layer_idx), False)):
+    if not _is_cutile_v_packed_cache_valid(
+        metadata,
+        layer_idx,
+        kv_cache,
+        v_head_dim=v_head_dim,
+        page_size=page_size,
+        local_layer=local_layer,
+        v_sf=v_sf,
+        page_ids=page_ids,
+    ):
         return None
     v_packed = getattr(metadata, _cutile_v_packed_attr(layer_idx), None)
     expected_shape = _cutile_v_packed_shape(kv_cache, v_head_dim, page_size)
@@ -2018,6 +2166,9 @@ def run_fp4_mla_attention_decode(
                 kv_cache,
                 v_head_dim=kv_lora_rank,
                 page_size=metadata.page_size,
+                local_layer=local_layer,
+                v_sf=v_sf,
+                page_ids=src_page_ids,
             )
             if cutile_auto_prepack_v
             else None
@@ -2036,6 +2187,12 @@ def run_fp4_mla_attention_decode(
                 dtype=torch.uint8,
                 device=q_nope.device,
             )
+        mark_cutile_v_packed_cache_valid = bool(
+            cutile_prepack_v_for_pv
+            and v_packed is not None
+            and _cutile_persistent_v_pack_enabled()
+            and _cutile_shared_v_pack_storage_enabled()
+        )
         _fp4_mla_debug(
             "attention decode cutile launch: "
             f"num_queries={num_queries} query_len_per_seq={query_len_per_seq} "
@@ -2076,6 +2233,17 @@ def run_fp4_mla_attention_decode(
             page_max_workspace=page_max,
             page_sum_workspace=page_sum,
         )
+        if mark_cutile_v_packed_cache_valid:
+            _set_cutile_v_packed_cache_valid(
+                metadata,
+                layer_idx,
+                kv_cache,
+                v_head_dim=kv_lora_rank,
+                page_size=metadata.page_size,
+                local_layer=local_layer,
+                v_sf=v_sf,
+                page_ids=src_page_ids,
+            )
         _debug_sync("attention_cutile")
         return
 
