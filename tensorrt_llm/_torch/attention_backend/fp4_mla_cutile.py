@@ -2062,7 +2062,7 @@ def _fp4_mla_attention_pv_kernel(
         and V_HEAD_D == 512
         and PAGE_SIZE == 128
         and BLOCK_H == 128
-        and BLOCK_V == 128
+        and (BLOCK_V == 128 or BLOCK_V == 256)
         and SF_PER_PAGE == 8
     ):
         p_view = tl.ext.make_view(
@@ -2083,7 +2083,7 @@ def _fp4_mla_attention_pv_kernel(
             base=v_sf_ptr,
             shapes=[num_pages, V_HEAD_D // 128, SF_PER_PAGE // 4, 2, 256],
             strides=[vsf_s0, 128 * (((SF_PER_PAGE + 3) // 4) * 4), 512, 256, 1],
-            tile_shape=[1, 1, SF_PER_PAGE // 4, 2, 256],
+            tile_shape=[1, BLOCK_V // 128, SF_PER_PAGE // 4, 2, 256],
             tile_dim_map=[0, 1, 2, 3, 4],
         )
         v_view = tl.ext.make_view(
@@ -2131,13 +2131,15 @@ def _fp4_mla_attention_pv_kernel(
                 v_sf_view,
                 [
                     physical_page.to(tl.int32),
-                    dim_block,
+                    dim_block * (BLOCK_V // 128),
                     0,
                     0,
                     0,
                 ],
             )
-            v_scales = v_scales.reshape([1, 1, SF_PER_PAGE // 4, 32, 4, 4]).trans(0, 1, 4, 3, 2, 5)
+            v_scales = v_scales.reshape([1, BLOCK_V // 128, SF_PER_PAGE // 4, 32, 4, 4]).trans(
+                0, 1, 4, 3, 2, 5
+            )
             v_scales = v_scales.reshape([BLOCK_V, SF_PER_PAGE])
             acc = tl.ext.dot_scaled(
                 v_vals,
@@ -2421,7 +2423,7 @@ def _fp4_mla_attention_pv_prepacked_v_kernel(
         and V_HEAD_D == 512
         and PAGE_SIZE == 128
         and BLOCK_H == 128
-        and BLOCK_V == 128
+        and (BLOCK_V == 128 or BLOCK_V == 256)
         and SF_PER_PAGE == 8
     ):
         p_view = tl.ext.make_view(
@@ -2442,7 +2444,7 @@ def _fp4_mla_attention_pv_prepacked_v_kernel(
             base=v_sf_ptr,
             shapes=[num_pages, V_HEAD_D // 128, SF_PER_PAGE // 4, 2, 256],
             strides=[vsf_s0, 128 * (((SF_PER_PAGE + 3) // 4) * 4), 512, 256, 1],
-            tile_shape=[1, 1, SF_PER_PAGE // 4, 2, 256],
+            tile_shape=[1, BLOCK_V // 128, SF_PER_PAGE // 4, 2, 256],
             tile_dim_map=[0, 1, 2, 3, 4],
         )
         v_view = tl.ext.make_view(
@@ -2495,13 +2497,15 @@ def _fp4_mla_attention_pv_prepacked_v_kernel(
                 v_sf_view,
                 [
                     physical_page.to(tl.int32),
-                    dim_block,
+                    dim_block * (BLOCK_V // 128),
                     0,
                     0,
                     0,
                 ],
             )
-            v_scales = v_scales.reshape([1, 1, SF_PER_PAGE // 4, 32, 4, 4]).trans(0, 1, 4, 3, 2, 5)
+            v_scales = v_scales.reshape([1, BLOCK_V // 128, SF_PER_PAGE // 4, 32, 4, 4]).trans(
+                0, 1, 4, 3, 2, 5
+            )
             v_scales = v_scales.reshape([BLOCK_V, SF_PER_PAGE])
             if PV_M_PACKED_V and not USE_PREPACKED_V:
                 acc = tl.ext.dot_scaled(
@@ -2945,7 +2949,7 @@ def fp4_mla_paged_attention_internal(
         and v_head_dim == 512
         and page_size == 128
         and block_h in (64, 128)
-        and block_v == 128
+        and block_v in (128, 256)
         and sf_per_page == 8
     )
     if not prepack_v_for_pv and not use_prepacked_v_for_pv:
@@ -2963,13 +2967,13 @@ def fp4_mla_paged_attention_internal(
         and v_head_dim == 512
         and page_size == 128
         and block_h in (64, 128)
-        and block_v == 128
+        and block_v in (128, 256)
         and sf_per_page == 8
     )
     if wants_prepacked_v_for_pv and not can_use_prepacked_v_for_pv:
         raise ValueError(
             "prepacked V PV path requires TMA, full heads/pages, valid pages, "
-            "v_head_dim=512, page_size=128, block_h in (64, 128), block_v=128, and sf_per_page=8."
+            "v_head_dim=512, page_size=128, block_h in (64, 128), block_v in (128, 256), and sf_per_page=8."
         )
     if can_use_prepacked_v_for_pv:
         v_packed = _workspace_tensor(
