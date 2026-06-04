@@ -1199,7 +1199,9 @@ def _fp4_mla_attention_page_stats_grouped_kernel(
     ASSUME_FULL_HEADS: tl.constexpr,
     ASSUME_FULL_PAGES: tl.constexpr,
     ASSUME_VALID_PAGES: tl.constexpr,
+    MAX_PAGES: tl.constexpr,
     GROUP_PAGES: tl.constexpr = 2,
+    ALLOW_PARTIAL_GROUPS: tl.constexpr = False,
     occupancy: tl.constexpr = 1,
 ):
     gen_idx = tl.program_id(0)
@@ -1300,8 +1302,14 @@ def _fp4_mla_attention_page_stats_grouped_kernel(
     group_sum = tl.zeros((BLOCK_H,), dtype=tl.float32)
     for page_group_off in tl.range(0, GROUP_PAGES):
         page_rel = page_group * GROUP_PAGES + page_group_off
+        valid_group_page = page_rel < MAX_PAGES
         compact_page = page_table_start + page_rel
-        physical_page = tl.load(src_page_ids_ptr + compact_page).to(tl.int64)
+        safe_compact_page = tl.where(valid_group_page, compact_page, page_table_start)
+        physical_page = tl.load(
+            src_page_ids_ptr + safe_compact_page,
+            mask=valid_group_page | (not ALLOW_PARTIAL_GROUPS),
+            other=0,
+        ).to(tl.int64)
 
         scores = tl.zeros((BLOCK_H, BLOCK_T), dtype=tl.float32)
         full_k_vals = k_desc.load([physical_page.to(tl.int32), 0, 0])
@@ -1351,12 +1359,20 @@ def _fp4_mla_attention_page_stats_grouped_kernel(
 
         scores = scores * qk_scale
         page_max = tl.max(scores, axis=1)
-        exp_scores = tl.math.exp2((scores - page_max[:, None]) * 1.4426950408889634)
+        if ALLOW_PARTIAL_GROUPS:
+            page_max = tl.where(valid_group_page, page_max, -float("inf"))
+            safe_page_max = tl.where(valid_group_page, page_max, 0.0)
+            exp_scores = tl.math.exp2((scores - safe_page_max[:, None]) * 1.4426950408889634)
+            exp_scores = tl.where(valid_group_page, exp_scores, 0.0)
+        else:
+            exp_scores = tl.math.exp2((scores - page_max[:, None]) * 1.4426950408889634)
         page_sum = tl.sum(exp_scores, axis=1)
         if GROUP_REDUCE_STATS:
             next_group_max = tl.maximum(group_max, page_max)
-            group_sum = group_sum * tl.math.exp2((group_max - next_group_max) * 1.4426950408889634) + page_sum * tl.math.exp2(
-                (page_max - next_group_max) * 1.4426950408889634
+            old_delta = tl.where(group_sum > 0.0, group_max - next_group_max, 0.0)
+            new_delta = tl.where(page_sum > 0.0, page_max - next_group_max, 0.0)
+            group_sum = group_sum * tl.math.exp2(old_delta * 1.4426950408889634) + page_sum * tl.math.exp2(
+                new_delta * 1.4426950408889634
             )
             group_max = next_group_max
 
@@ -1370,18 +1386,28 @@ def _fp4_mla_attention_page_stats_grouped_kernel(
         packed = _fp4_e2m1_quantize_packed(even_probs, odd_probs)
 
         out_offsets = gen_idx * page_stats_s0 + page_rel * page_stats_s1 + offs_h
-        tl.store(page_max_ptr + out_offsets, page_max)
+        tl.store(page_max_ptr + out_offsets, page_max, mask=valid_group_page | (not ALLOW_PARTIAL_GROUPS))
         if not GROUP_REDUCE_STATS:
-            tl.store(page_sum_ptr + out_offsets, page_sum)
+            tl.store(page_sum_ptr + out_offsets, page_sum, mask=valid_group_page | (not ALLOW_PARTIAL_GROUPS))
 
         sf_offsets = _fp4_mla_swizzled_sf_offset_row_block(
-            compact_page, offs_h[:, None], scale_cols[None, :], SF_PER_PAGE
+            safe_compact_page, offs_h[:, None], scale_cols[None, :], SF_PER_PAGE
         )
-        tl.store(p_sf_ptr + sf_offsets, stored_scale)
-        p_desc.store(
-            [(compact_page * NUM_HEADS + head_block * BLOCK_H).to(tl.int32), 0],
-            tl.reshape(packed, (BLOCK_H, PAGE_SIZE // 2)),
-        )
+        tl.store(p_sf_ptr + sf_offsets, stored_scale, mask=valid_group_page | (not ALLOW_PARTIAL_GROUPS))
+        if ALLOW_PARTIAL_GROUPS:
+            byte_offsets = tl.arange(0, FP4_BLOCK // 2)
+            byte_cols = scale_cols[:, None] * (FP4_BLOCK // 2) + byte_offsets[None, :]
+            safe_p_rows = safe_compact_page * NUM_HEADS + offs_h
+            tl.store(
+                p_fp4_ptr + safe_p_rows[:, None, None] * p_s0 + byte_cols[None, :, :] * p_s1,
+                packed,
+                mask=valid_group_page,
+            )
+        else:
+            p_desc.store(
+                [(compact_page * NUM_HEADS + head_block * BLOCK_H).to(tl.int32), 0],
+                tl.reshape(packed, (BLOCK_H, PAGE_SIZE // 2)),
+            )
     if GROUP_REDUCE_STATS:
         group_max_offsets = gen_idx * page_stats_s0 + (page_group * 2) * page_stats_s1 + offs_h
         group_sum_offsets = group_max_offsets + page_stats_s1
@@ -1403,6 +1429,7 @@ def _fp4_mla_attention_reduce_stats_kernel(
     BLOCK_H: tl.constexpr,
     GROUP_REDUCE_STATS: tl.constexpr = False,
     GROUP_PAGES: tl.constexpr = 1,
+    NUM_PAGE_GROUPS: tl.constexpr = 0,
     occupancy: tl.constexpr = 1,
 ):
     gen_idx = tl.program_id(0)
@@ -1413,7 +1440,7 @@ def _fp4_mla_attention_reduce_stats_kernel(
 
     max_score = tl.full((BLOCK_H,), -float("inf"), dtype=tl.float32)
     if GROUP_REDUCE_STATS:
-        for group_rel in tl.range(0, MAX_PAGES // GROUP_PAGES):
+        for group_rel in tl.range(0, NUM_PAGE_GROUPS):
             group_max = tl.load(
                 page_sum_ptr + gen_idx * page_stats_s0 + (group_rel * 2) * page_stats_s1 + safe_offs_h,
                 mask=mask_h,
@@ -1431,7 +1458,7 @@ def _fp4_mla_attention_reduce_stats_kernel(
 
     denom = tl.zeros((BLOCK_H,), dtype=tl.float32)
     if GROUP_REDUCE_STATS:
-        for group_rel in tl.range(0, MAX_PAGES // GROUP_PAGES):
+        for group_rel in tl.range(0, NUM_PAGE_GROUPS):
             group_max = tl.load(
                 page_sum_ptr + gen_idx * page_stats_s0 + (group_rel * 2) * page_stats_s1 + safe_offs_h,
                 mask=mask_h,
@@ -3028,7 +3055,7 @@ def fp4_mla_paged_attention_internal(
             (
                 group_size
                 for group_size in reversed(page_stats_group_sizes)
-                if group_size <= target_group_pages and max_pages % group_size == 0
+                if group_size <= target_group_pages
             ),
             8,
         )
@@ -3053,9 +3080,10 @@ def fp4_mla_paged_attention_internal(
         and full_block_end == 512
         and tail_block_k == 128
         and sf_per_page == 8
-        and max_pages % page_stats_group_size == 0
     )
     page_stats_group_size = page_stats_group_size if can_group_page_stats else 1
+    num_page_groups = _ceil_div(max_pages, page_stats_group_size) if page_stats_group_size > 1 else max_pages
+    allow_partial_page_groups = page_stats_group_size > 1 and max_pages % page_stats_group_size != 0
     group_reduce_stats = (
         (env_group_reduce_stats != 0 if env_group_reduce_stats is not None else triton_backend == "nvt")
         and page_stats_group_size > 1
@@ -3078,7 +3106,7 @@ def fp4_mla_paged_attention_internal(
         )
         if page_stats_group_size > 1:
             _fp4_mla_attention_page_stats_grouped_kernel[
-                (num_gen, num_head_blocks, max_pages // page_stats_group_size)
+                (num_gen, num_head_blocks, num_page_groups)
             ](
                 page_max,
                 page_sum,
@@ -3128,7 +3156,9 @@ def fp4_mla_paged_attention_internal(
                 ASSUME_FULL_HEADS=assume_full_heads,
                 ASSUME_FULL_PAGES=assume_full_pages,
                 ASSUME_VALID_PAGES=assume_valid_pages,
+                MAX_PAGES=max_pages,
                 GROUP_PAGES=page_stats_group_size,
+                ALLOW_PARTIAL_GROUPS=allow_partial_page_groups,
                 **page_stats_launch_meta,
             )
         else:
@@ -3198,6 +3228,7 @@ def fp4_mla_paged_attention_internal(
             BLOCK_H=block_h,
             GROUP_REDUCE_STATS=group_reduce_stats,
             GROUP_PAGES=page_stats_group_size,
+            NUM_PAGE_GROUPS=num_page_groups,
             **page_stats_launch_meta,
         )
         if pack_prob_in_page_stats:

@@ -1426,6 +1426,22 @@ def test_fp4_mla_attention_decode_cutile_shared_v_pack_matches_reference(monkeyp
 
 
 @pytest.mark.skipif(_is_pre_blackwell(), reason="requires Blackwell FP4 support")
+def test_fp4_mla_attention_decode_cutile_grouped_tail_matches_reference(monkeypatch):
+    """Grouped page-stats must handle a partial final page group."""
+    monkeypatch.setenv("TRTLLM_FP4_MLA_PERSISTENT_V_PACK", "1")
+    monkeypatch.setenv("TRTLLM_FP4_MLA_SHARE_V_PACK_STORAGE", "1")
+    monkeypatch.setenv("TRTLLM_FP4_MLA_GROUP_PAGES", "8")
+    _assert_fp4_mla_attention_decode_accuracy(
+        monkeypatch,
+        backend="cutile",
+        num_heads=128,
+        seq_lens=[9 * FP4_MLA_TOKENS_PER_BLOCK, 9 * FP4_MLA_TOKENS_PER_BLOCK],
+        seed=19,
+        check_probs=False,
+    )
+
+
+@pytest.mark.skipif(_is_pre_blackwell(), reason="requires Blackwell FP4 support")
 def test_fp4_mla_cutile_shared_v_pack_storage_is_layer_tagged(monkeypatch):
     """Layer ownership is metadata state; storage is reused across layers."""
     monkeypatch.setenv(FLASHINFER_FP4_MLA_ATTENTION_BACKEND_ENV, "cutile")
