@@ -2150,14 +2150,12 @@ def run_fp4_mla_attention_decode(
                 dtype=torch.float32,
                 device=q_nope.device,
             )
-        assume_full_pages = (
-            _infer_cutile_assume_full_pages(
-                metadata,
-                max_pages,
-                metadata.page_size,
-            )
-            and query_len_per_seq == 1
+        cutile_storage_full_pages = _infer_cutile_assume_full_pages(
+            metadata,
+            max_pages,
+            metadata.page_size,
         )
+        assume_full_pages = cutile_storage_full_pages and query_len_per_seq == 1
         assume_valid_pages = False
         cutile_num_gen_seqs = num_queries // query_len_per_seq
         cutile_block_h = _env_int("TRTLLM_FP4_MLA_BLOCK_H") or 128
@@ -2165,21 +2163,35 @@ def run_fp4_mla_attention_decode(
             cutile_num_gen_seqs,
             query_len_per_seq=query_len_per_seq,
         )
+        cutile_prepack_v_env = os.environ.get("TRTLLM_FP4_MLA_PREPACK_V")
+        cutile_storage_valid_pages = (
+            assume_valid_pages
+            or (
+                cutile_storage_full_pages
+                and src_page_ids.numel() == cutile_num_gen_seqs * max_pages
+            )
+        )
+        cutile_allow_qlen_prepack_v = query_len_per_seq > 1 and cutile_prepack_v_env != "0"
         cutile_assume_valid_pages = assume_valid_pages or (
             assume_full_pages and src_page_ids.numel() == cutile_num_gen_seqs * max_pages
         )
         cutile_auto_prepack_v = (
             hasattr(tl, "make_tensor_descriptor")
             and num_heads % cutile_block_h == 0
-            and assume_full_pages
-            and cutile_assume_valid_pages
+            and (
+                assume_full_pages
+                or (cutile_allow_qlen_prepack_v and cutile_storage_full_pages)
+            )
+            and (
+                cutile_assume_valid_pages
+                or (cutile_allow_qlen_prepack_v and cutile_storage_valid_pages)
+            )
             and kv_lora_rank == 512
             and metadata.page_size == FP4_MLA_TOKENS_PER_BLOCK
             and cutile_block_h in (64, 128)
             and cutile_block_v in (128, 256)
             and metadata.page_size // FP4_BLOCK_SIZE == 8
         )
-        cutile_prepack_v_env = os.environ.get("TRTLLM_FP4_MLA_PREPACK_V")
         cutile_prepack_v_for_pv = (
             cutile_auto_prepack_v
             if cutile_prepack_v_env is None
