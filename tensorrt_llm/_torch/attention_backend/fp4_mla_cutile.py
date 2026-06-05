@@ -4199,6 +4199,249 @@ def _fp4_mla_attention_online_qkpv_group_kernel(
 
 
 @triton.jit
+def _fp4_mla_attention_mtp_fused_qkpv_group_kernel(
+    partial_o_ptr,
+    partial_m_ptr,
+    partial_l_ptr,
+    q_fp4_ptr,
+    q_sf_ptr,
+    kv_cache_ptr,
+    sf_cache_ptr,
+    v_sf_ptr,
+    v_packed_ptr,
+    global_scale_ptr,
+    src_page_ids_ptr,
+    paged_kv_indptr_decode_ptr,
+    kv_lens_ptr,
+    page_ids_len: tl.constexpr,
+    num_pages: tl.constexpr,
+    q_fp4_s0: tl.constexpr,
+    q_fp4_s1: tl.constexpr,
+    kv_s0: tl.constexpr,
+    kv_s2: tl.constexpr,
+    kv_s4: tl.constexpr,
+    sf_s0: tl.constexpr,
+    vsf_s0: tl.constexpr,
+    po_s0: tl.constexpr,
+    po_s1: tl.constexpr,
+    po_s2: tl.constexpr,
+    po_s3: tl.constexpr,
+    pm_s0: tl.constexpr,
+    pm_s1: tl.constexpr,
+    q_num_rows: tl.constexpr,
+    sm_scale: tl.constexpr,
+    NUM_HEADS: tl.constexpr,
+    Q_HEAD_D: tl.constexpr,
+    K_HEAD_D: tl.constexpr,
+    Q_RESIDUAL_D: tl.constexpr,
+    V_HEAD_D: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    FP4_BLOCK: tl.constexpr,
+    Q_SF_PER_TOKEN: tl.constexpr,
+    K_SF_PER_TOKEN: tl.constexpr,
+    SF_PER_PAGE: tl.constexpr,
+    P_GLOBAL_SCALE: tl.constexpr,
+    QUERY_LEN_PER_SEQ: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    BLOCK_T: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    FULL_BLOCK_END: tl.constexpr,
+    TAIL_BLOCK_K: tl.constexpr,
+    BLOCK_V: tl.constexpr,
+    MAX_PAGES: tl.constexpr,
+    GROUP_PAGES: tl.constexpr,
+    NUM_DIM_BLOCKS: tl.constexpr,
+    ALLOW_PARTIAL_GROUPS: tl.constexpr,
+    SPLIT_PV_K: tl.constexpr,
+    USE_TMA_DATA_LOAD: tl.constexpr,
+    ASSUME_FULL_HEADS: tl.constexpr,
+    ASSUME_VALID_PAGES: tl.constexpr,
+    occupancy: tl.constexpr = 1,
+):
+    query_idx = tl.program_id(0)
+    head_block = tl.program_id(1)
+    combo = tl.program_id(2)
+    page_group = combo // NUM_DIM_BLOCKS
+    dim_block = combo - page_group * NUM_DIM_BLOCKS
+    seq_idx = query_idx // QUERY_LEN_PER_SEQ
+    query_offset = query_idx - seq_idx * QUERY_LEN_PER_SEQ
+
+    offs_h = head_block * BLOCK_H + tl.arange(0, BLOCK_H)
+    offs_t = tl.arange(0, BLOCK_T)
+    offs_v = dim_block * BLOCK_V + tl.arange(0, BLOCK_V)
+    q_row_base = query_idx * NUM_HEADS
+    page_table_start = tl.load(paged_kv_indptr_decode_ptr + seq_idx).to(tl.int64)
+    kv_len = tl.load(kv_lens_ptr + seq_idx) - (QUERY_LEN_PER_SEQ - 1 - query_offset)
+    kv_len = tl.maximum(kv_len, 0)
+    global_scale = tl.load(global_scale_ptr)
+    qk_scale = sm_scale / (global_scale * global_scale)
+
+    v_packed_desc = tl.make_tensor_descriptor(
+        v_packed_ptr,
+        shape=[num_pages * NUM_DIM_BLOCKS * BLOCK_V, PAGE_SIZE // 2],
+        strides=[PAGE_SIZE // 2, 1],
+        block_shape=[BLOCK_V, PAGE_SIZE // 2],
+    )
+    v_sf_view = tl.ext.make_view(
+        base=v_sf_ptr,
+        shapes=[num_pages, V_HEAD_D // 128, SF_PER_PAGE // 4, 2, 256],
+        strides=[vsf_s0, 128 * (((SF_PER_PAGE + 3) // 4) * 4), 512, 256, 1],
+        tile_shape=[1, BLOCK_V // 128, SF_PER_PAGE // 4, 2, 256],
+        tile_dim_map=[0, 1, 2, 3, 4],
+    )
+
+    group_m = tl.full((BLOCK_H,), -float("inf"), dtype=tl.float32)
+    group_l = tl.zeros((BLOCK_H,), dtype=tl.float32)
+    group_o = tl.zeros((BLOCK_V, BLOCK_H), dtype=tl.float32)
+    for page_group_off in tl.range(0, GROUP_PAGES):
+        page_rel = page_group * GROUP_PAGES + page_group_off
+        page_start = page_rel * PAGE_SIZE
+        valid_group_page = page_rel < MAX_PAGES
+        valid_page_tokens = valid_group_page & (page_start < kv_len)
+        compact_page = page_table_start + page_rel
+        safe_compact_page = tl.where(valid_group_page, compact_page, page_table_start)
+        physical_page = tl.load(
+            src_page_ids_ptr + safe_compact_page,
+            mask=valid_group_page | (not ALLOW_PARTIAL_GROUPS),
+            other=0,
+        ).to(tl.int64)
+
+        scores = _fp4_mla_qk_scores_tile(
+            q_fp4_ptr,
+            q_sf_ptr,
+            kv_cache_ptr,
+            sf_cache_ptr,
+            src_page_ids_ptr,
+            safe_compact_page,
+            q_row_base,
+            head_block * BLOCK_H,
+            offs_h,
+            offs_t,
+            q_num_rows,
+            q_fp4_s0,
+            q_fp4_s1,
+            kv_s0,
+            kv_s2,
+            kv_s4,
+            sf_s0,
+            page_ids_len,
+            num_pages,
+            Q_HEAD_D,
+            K_HEAD_D,
+            Q_RESIDUAL_D,
+            FP4_BLOCK,
+            Q_SF_PER_TOKEN,
+            K_SF_PER_TOKEN,
+            BLOCK_H,
+            BLOCK_T,
+            BLOCK_K,
+            FULL_BLOCK_END,
+            TAIL_BLOCK_K,
+            NUM_HEADS,
+            USE_TMA_DATA_LOAD,
+            ASSUME_FULL_HEADS,
+            ASSUME_VALID_PAGES,
+        )
+        valid_t = page_start + offs_t < kv_len
+        scores = tl.where(valid_page_tokens & valid_t[None, :], scores * qk_scale, -float("inf"))
+        page_m = tl.max(scores, axis=1)
+        safe_page_m = tl.where(valid_page_tokens, page_m, 0.0)
+        exp_scores = tl.math.exp2((scores - safe_page_m[:, None]) * 1.4426950408889634)
+        exp_scores = tl.where(valid_page_tokens & valid_t[None, :], exp_scores, 0.0)
+        page_l = tl.sum(exp_scores, axis=1)
+
+        grouped_probs = tl.reshape(exp_scores, (BLOCK_H, SF_PER_PAGE, FP4_BLOCK))
+        amax = tl.max(grouped_probs, axis=2)
+        inv_local_scale = tl.where(amax > 0.0, 6.0 / amax, 1.0)
+        p_scales = tl.where(amax > 0.0, tl.minimum(amax * (P_GLOBAL_SCALE / 6.0), 448.0), 1.0)
+        p_scales = p_scales.to(tl.float8e4nv)
+        scaled_probs = grouped_probs * tl.reshape(inv_local_scale, (BLOCK_H, SF_PER_PAGE, 1))
+        pairs = tl.reshape(scaled_probs, (BLOCK_H, SF_PER_PAGE, FP4_BLOCK // 2, 2))
+        even_probs, odd_probs = tl.split(pairs)
+        p_vals = tl.reshape(_fp4_e2m1_quantize_packed(even_probs, odd_probs), (BLOCK_H, PAGE_SIZE // 2))
+
+        v_row = (physical_page * NUM_DIM_BLOCKS + dim_block) * BLOCK_V
+        v_vals = v_packed_desc.load([v_row.to(tl.int32), 0])
+        v_scales = tl.ext.load_view_tko(
+            v_sf_view,
+            [
+                physical_page.to(tl.int32),
+                dim_block * (BLOCK_V // 128),
+                0,
+                0,
+                0,
+            ],
+        )
+        v_scales = v_scales.reshape([1, BLOCK_V // 128, SF_PER_PAGE // 4, 32, 4, 4]).trans(
+            0, 1, 4, 3, 2, 5
+        )
+        v_scales = v_scales.reshape([BLOCK_V, SF_PER_PAGE])
+        if SPLIT_PV_K:
+            v_val_halves = tl.reshape(v_vals, (BLOCK_V, 2, PAGE_SIZE // 4)).trans(0, 2, 1)
+            v_vals0, v_vals1 = tl.split(v_val_halves)
+            v_scale_halves = tl.reshape(v_scales, (BLOCK_V, 2, SF_PER_PAGE // 2)).trans(0, 2, 1)
+            v_scales0, v_scales1 = tl.split(v_scale_halves)
+            p_val_halves = tl.reshape(p_vals, (BLOCK_H, 2, PAGE_SIZE // 4)).trans(0, 2, 1)
+            p_vals0, p_vals1 = tl.split(p_val_halves)
+            p_scale_halves = tl.reshape(p_scales, (BLOCK_H, 2, SF_PER_PAGE // 2)).trans(0, 2, 1)
+            p_scales0, p_scales1 = tl.split(p_scale_halves)
+            page_o = tl.ext.dot_scaled(
+                v_vals0,
+                v_scales0,
+                "e2m1",
+                p_vals0.T,
+                p_scales0,
+                "e2m1",
+                acc=tl.zeros((BLOCK_V, BLOCK_H), dtype=tl.float32),
+                fast_math=True,
+                rhs_k_pack=True,
+            )
+            page_o = tl.ext.dot_scaled(
+                v_vals1,
+                v_scales1,
+                "e2m1",
+                p_vals1.T,
+                p_scales1,
+                "e2m1",
+                acc=page_o,
+                fast_math=True,
+                rhs_k_pack=True,
+            )
+        else:
+            page_o = tl.ext.dot_scaled(
+                v_vals,
+                v_scales,
+                "e2m1",
+                p_vals.T,
+                p_scales,
+                "e2m1",
+                acc=tl.zeros((BLOCK_V, BLOCK_H), dtype=tl.float32),
+                fast_math=True,
+                rhs_k_pack=True,
+            )
+
+        next_m = tl.maximum(group_m, page_m)
+        old_delta = tl.where(group_l > 0.0, group_m - next_m, 0.0)
+        new_delta = tl.where(page_l > 0.0, page_m - next_m, 0.0)
+        old_scale = tl.math.exp2(old_delta * 1.4426950408889634)
+        new_scale = tl.math.exp2(new_delta * 1.4426950408889634)
+        group_o = group_o * old_scale[None, :] + page_o * new_scale[None, :]
+        group_l = group_l * old_scale + page_l * new_scale
+        group_m = next_m
+
+    partial_o_offsets = (
+        page_group * po_s0
+        + query_idx * po_s1
+        + offs_h[:, None] * po_s2
+        + offs_v[None, :] * po_s3
+    )
+    tl.store(partial_o_ptr + partial_o_offsets, group_o.T)
+    partial_ml_offsets = page_group * pm_s0 + query_idx * pm_s1 + offs_h
+    tl.store(partial_m_ptr + partial_ml_offsets, group_m)
+    tl.store(partial_l_ptr + partial_ml_offsets, group_l)
+
+
+@triton.jit
 def _fp4_mla_attention_online_qkpv_reduce_kernel(
     out_ptr,
     partial_o_ptr,
@@ -4833,6 +5076,12 @@ def fp4_mla_paged_attention_internal(
     env_online_qkpv_group_pages = _env_int("TRTLLM_FP4_MLA_ONLINE_QKPV_GROUP_PAGES")
     env_online_qkpv_max_batch = _env_int("TRTLLM_FP4_MLA_ONLINE_QKPV_MAX_BATCH")
     env_online_qkpv_fp4_pv = _env_int("TRTLLM_FP4_MLA_ONLINE_QKPV_FP4_PV")
+    env_mtp_fused_qkpv = _env_int("TRTLLM_FP4_MLA_MTP_FUSED_QKPV")
+    env_mtp_fused_qkpv_group_pages = _env_int("TRTLLM_FP4_MLA_MTP_FUSED_QKPV_GROUP_PAGES")
+    env_mtp_fused_qkpv_block_h = _env_int("TRTLLM_FP4_MLA_MTP_FUSED_QKPV_BLOCK_H")
+    env_mtp_fused_qkpv_block_v = _env_int("TRTLLM_FP4_MLA_MTP_FUSED_QKPV_BLOCK_V")
+    env_mtp_fused_qkpv_split_pv_k = _env_int("TRTLLM_FP4_MLA_MTP_FUSED_QKPV_SPLIT_PV_K")
+    env_mtp_fused_qkpv_occupancy = _env_int("TRTLLM_FP4_MLA_MTP_FUSED_QKPV_OCCUPANCY")
     env_mtp_page_stats_pair = _env_int("TRTLLM_FP4_MLA_MTP_PAGE_STATS_PAIR")
     env_mtp_pv_pair = _env_int("TRTLLM_FP4_MLA_MTP_PV_PAIR")
     env_mtp_split_tail_group = _env_int("TRTLLM_FP4_MLA_MTP_SPLIT_TAIL_GROUP")
@@ -5099,6 +5348,169 @@ def fp4_mla_paged_attention_internal(
                 BLOCK_V=v_repack_block_v,
                 **launch_meta,
             )
+
+    mtp_fused_block_h = env_mtp_fused_qkpv_block_h if env_mtp_fused_qkpv_block_h is not None else 32
+    if env_mtp_fused_qkpv == 1 and mtp_fused_block_h not in (16, 32, 64, 128):
+        raise ValueError(
+            "TRTLLM_FP4_MLA_MTP_FUSED_QKPV_BLOCK_H currently supports 16, 32, 64, or 128, "
+            f"got {mtp_fused_block_h}."
+        )
+    mtp_fused_block_v = env_mtp_fused_qkpv_block_v if env_mtp_fused_qkpv_block_v is not None else v_head_dim
+    if env_mtp_fused_qkpv == 1 and mtp_fused_block_v not in (128, 256, 512):
+        raise ValueError(
+            "TRTLLM_FP4_MLA_MTP_FUSED_QKPV_BLOCK_V currently supports 128, 256, or 512, "
+            f"got {mtp_fused_block_v}."
+        )
+    if env_mtp_fused_qkpv == 1 and v_head_dim % mtp_fused_block_v != 0:
+        raise ValueError(
+            f"TRTLLM_FP4_MLA_MTP_FUSED_QKPV_BLOCK_V={mtp_fused_block_v} must divide v_head_dim={v_head_dim}."
+        )
+    num_mtp_fused_dim_blocks = triton.cdiv(v_head_dim, mtp_fused_block_v)
+    mtp_fused_group_pages = env_mtp_fused_qkpv_group_pages if env_mtp_fused_qkpv_group_pages is not None else 128
+    mtp_fused_group_pages = max(1, min(int(mtp_fused_group_pages), max_pages))
+    mtp_fused_launch_meta = dict(page_stats_launch_meta)
+    mtp_fused_reduce_meta = dict(pv_launch_meta)
+    if env_mtp_fused_qkpv_occupancy is not None:
+        mtp_fused_launch_meta["occupancy"] = int(env_mtp_fused_qkpv_occupancy)
+        mtp_fused_reduce_meta["occupancy"] = int(env_mtp_fused_qkpv_occupancy)
+    elif env_occupancy is None:
+        mtp_fused_launch_meta["occupancy"] = 1
+        mtp_fused_reduce_meta["occupancy"] = 1
+    can_use_mtp_fused_qkpv = (
+        env_mtp_fused_qkpv == 1
+        and p_by_query
+        and query_len_per_seq == 4
+        and can_use_prepacked_v_for_pv
+        and can_address_all_compact_pages
+        and use_tma_data_load
+        and num_heads % mtp_fused_block_h == 0
+        and num_heads == 128
+        and q_head_dim == 640
+        and k_head_dim == 576
+        and q_residual_dim == 64
+        and v_head_dim == 512
+        and page_size == 128
+        and block_k == 512
+        and full_block_end == 512
+        and tail_block_k == 128
+        and block_v in (128, 256)
+        and sf_per_page == 8
+    )
+    if can_use_mtp_fused_qkpv:
+        if v_repack_stream is not None:
+            torch.cuda.current_stream(q_fp4.device).wait_stream(v_repack_stream)
+            v_repack_stream = None
+        num_mtp_fused_page_groups = _ceil_div(max_pages, mtp_fused_group_pages)
+        num_mtp_fused_head_blocks = triton.cdiv(num_heads, mtp_fused_block_h)
+        mtp_fused_partial_o = _workspace_tensor(
+            None,
+            (num_mtp_fused_page_groups, num_gen, num_heads, v_head_dim),
+            dtype=torch.float32,
+            device=q_fp4.device,
+            name="mtp_fused_partial_o",
+        )
+        mtp_fused_partial_m = _workspace_tensor(
+            None,
+            (num_mtp_fused_page_groups, num_gen, num_heads),
+            dtype=torch.float32,
+            device=q_fp4.device,
+            name="mtp_fused_partial_m",
+        )
+        mtp_fused_partial_l = _workspace_tensor(
+            None,
+            (num_mtp_fused_page_groups, num_gen, num_heads),
+            dtype=torch.float32,
+            device=q_fp4.device,
+            name="mtp_fused_partial_l",
+        )
+        _fp4_mla_attention_mtp_fused_qkpv_group_kernel[
+            (num_gen, num_mtp_fused_head_blocks, num_mtp_fused_page_groups * num_mtp_fused_dim_blocks)
+        ](
+            mtp_fused_partial_o,
+            mtp_fused_partial_m,
+            mtp_fused_partial_l,
+            q_fp4_2d,
+            q_sf_flat,
+            kv_cache,
+            sf_cache,
+            v_sf,
+            v_packed,
+            global_scale,
+            src_page_ids,
+            paged_kv_indptr_decode,
+            kv_lens,
+            src_page_ids.shape[0],
+            num_pages,
+            q_fp4_2d.stride(0),
+            q_fp4_2d.stride(1),
+            kv_s0,
+            kv_s2,
+            kv_s4,
+            sf_cache.stride(0),
+            v_sf.stride(0),
+            mtp_fused_partial_o.stride(0),
+            mtp_fused_partial_o.stride(1),
+            mtp_fused_partial_o.stride(2),
+            mtp_fused_partial_o.stride(3),
+            mtp_fused_partial_m.stride(0),
+            mtp_fused_partial_m.stride(1),
+            q_fp4_2d.shape[0],
+            sm_scale=sm_scale,
+            NUM_HEADS=num_heads,
+            Q_HEAD_D=q_head_dim,
+            K_HEAD_D=k_head_dim,
+            Q_RESIDUAL_D=q_residual_dim,
+            V_HEAD_D=v_head_dim,
+            PAGE_SIZE=page_size,
+            FP4_BLOCK=FP4_BLOCK_SIZE,
+            Q_SF_PER_TOKEN=q_sf_per_token,
+            K_SF_PER_TOKEN=k_sf_per_token,
+            SF_PER_PAGE=sf_per_page,
+            P_GLOBAL_SCALE=p_global_scale,
+            QUERY_LEN_PER_SEQ=query_len_per_seq,
+            BLOCK_H=mtp_fused_block_h,
+            BLOCK_T=page_size,
+            BLOCK_K=block_k,
+            FULL_BLOCK_END=full_block_end,
+            TAIL_BLOCK_K=tail_block_k,
+            BLOCK_V=mtp_fused_block_v,
+            MAX_PAGES=max_pages,
+            GROUP_PAGES=mtp_fused_group_pages,
+            NUM_DIM_BLOCKS=num_mtp_fused_dim_blocks,
+            ALLOW_PARTIAL_GROUPS=max_pages % mtp_fused_group_pages != 0,
+            SPLIT_PV_K=env_mtp_fused_qkpv_split_pv_k == 1,
+            USE_TMA_DATA_LOAD=use_tma_data_load,
+            ASSUME_FULL_HEADS=True,
+            ASSUME_VALID_PAGES=True,
+            **mtp_fused_launch_meta,
+        )
+        _fp4_mla_attention_online_qkpv_reduce_kernel[
+            (num_gen, num_mtp_fused_head_blocks, num_mtp_fused_dim_blocks)
+        ](
+            output,
+            mtp_fused_partial_o,
+            mtp_fused_partial_m,
+            mtp_fused_partial_l,
+            global_scale,
+            output.stride(0),
+            output.stride(1),
+            output.stride(2),
+            mtp_fused_partial_o.stride(0),
+            mtp_fused_partial_o.stride(1),
+            mtp_fused_partial_o.stride(2),
+            mtp_fused_partial_o.stride(3),
+            mtp_fused_partial_m.stride(0),
+            mtp_fused_partial_m.stride(1),
+            NUM_HEADS=num_heads,
+            V_HEAD_D=v_head_dim,
+            NUM_PAGE_GROUPS=num_mtp_fused_page_groups,
+            P_GLOBAL_SCALE=p_global_scale,
+            BLOCK_H=mtp_fused_block_h,
+            BLOCK_V=mtp_fused_block_v,
+            FP4_PV=True,
+            **mtp_fused_reduce_meta,
+        )
+        return output
 
     online_qkpv_max_batch = env_online_qkpv_max_batch if env_online_qkpv_max_batch is not None else 32
     can_use_online_qkpv = (
