@@ -2262,6 +2262,11 @@ def run_fp4_mla_attention_decode(
             query_len_per_seq=query_len_per_seq,
             block_v=cutile_block_v,
             assume_full_pages=assume_full_pages,
+            assume_full_pages_except_mtp_tail=(
+                cutile_storage_full_pages
+                and query_len_per_seq > 1
+                and query_len_per_seq <= metadata.page_size
+            ),
             assume_valid_pages=assume_valid_pages,
             prepack_v_for_pv=cutile_prepack_v_for_pv,
             use_prepacked_v_for_pv=use_cutile_v_packed_cache,
