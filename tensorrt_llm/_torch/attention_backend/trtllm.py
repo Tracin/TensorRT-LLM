@@ -52,6 +52,7 @@ _THOP_LITERALS: dict = {
     "compressed_kv_cache_pool_ptr": None,
 }
 
+
 @functools.cache
 def generate_spec_decoding_position_offsets(max_num_requests: int,
                                             draft_len: int) -> torch.Tensor:
@@ -162,10 +163,6 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     # Standalone tensor, not part of the block-based paged KV cache.
     high_precision_kv_pool: Optional[torch.Tensor] = None
     fp4_mla_hp_snapshot_pool: Optional[torch.Tensor] = None
-    # Ownership tracking: maps seq_slot to request_id that last wrote it.
-    # Plain Python dict, updated during context phase, checked during decode.
-    # Debug only; runs outside CUDA graph.
-    hp_pool_owners: Optional[dict] = None
 
     # Pre-computed FlashMLA tile-scheduler metadata and num_splits.
     # Computed once per forward pass in TrtllmAttention.forward() and reused across layers.
@@ -442,7 +439,6 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 device='cpu',
                 pin_memory=prefer_pinned(),
             )
-            self.hp_pool_owners = {}
             num_local_layers = self.kv_cache_manager.num_local_layers
             head_dim = self.kv_cache_manager.head_dim
             kv_factor = self.kv_cache_manager.kv_factor
