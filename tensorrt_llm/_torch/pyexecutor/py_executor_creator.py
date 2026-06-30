@@ -228,6 +228,25 @@ def _select_mla_tokens_per_block(config, model_config, kv_cache_config,
     return tokens_per_block
 
 
+def _configure_fp4_mla_speculative_kv_cache(spec_config, config, model_config,
+                                            kv_cache_config, model) -> None:
+    if (spec_config is None or not spec_config.spec_dec_mode.use_one_engine()
+            or not is_mla(config)
+            or not _has_fp4_kv_cache(model_config, kv_cache_config)
+            or not _enable_fp4_mla_attention(model_config)):
+        return
+
+    # FP4 MLA side pools live on attention metadata and are not switched by
+    # draft_kv_cache_context. Keep target and one-model draft layers in one
+    # manager so their global layer IDs address distinct HP/V-scale state.
+    spec_config._allow_separate_draft_kv_cache = False
+    if hasattr(model, 'use_separate_draft_kv_cache'):
+        model.use_separate_draft_kv_cache = False
+    spec_worker = getattr(model, 'spec_worker', None)
+    if spec_worker is not None:
+        spec_worker.use_separate_draft_kv_cache = False
+
+
 def _get_mapping(_mapping: Mapping) -> Mapping:
     if _mapping is None:
         mapping = Mapping(world_size=tensorrt_llm.mpi_world_size(),
@@ -697,6 +716,13 @@ def create_py_executor(
         cache_transceiver_config.max_tokens_in_buffer = net_max_seq_len
 
     config = model_engine.model.model_config.pretrained_config
+    _configure_fp4_mla_speculative_kv_cache(
+        spec_config,
+        config,
+        model_engine.model.model_config,
+        kv_cache_config,
+        model_engine.model,
+    )
     if is_hybrid_linear(config) and kv_cache_config.enable_block_reuse and (
             cache_transceiver_config is not None
             and cache_transceiver_config.backend is not None

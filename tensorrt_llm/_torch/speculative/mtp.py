@@ -913,6 +913,7 @@ class MTPWorker(SpecWorkerBase):
             attn_metadata.kv_lens_cuda[num_contexts:batch_size].clamp_(
                 min=mtp_num_modules)
             attn_metadata.on_update_kv_lens()
+            attn_metadata.update_for_spec_dec()
         elif getattr(attn_metadata, "kv_lens_cuda_runtime", None) is not None:
             attn_metadata.kv_lens_cuda_runtime[num_contexts:batch_size] -= (
                 mtp_num_modules + 1 -

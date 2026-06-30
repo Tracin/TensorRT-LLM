@@ -593,6 +593,10 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         if self.enable_flash_mla:
             self._flash_mla_metadata_valid = False
 
+    def _update_fp4_mla_append_metadata(self) -> None:
+        if self.high_precision_kv_pool is not None and self.num_tokens > 0:
+            self._populate_fp4_mla_batch_indices_positions()
+
     def update_for_spec_dec(self) -> None:
         # MTP updates kv_lens_cuda in-place between sub-steps, which changes
         # cache_seq_lens seen by the C++ attention op.  Invalidate the metadata
@@ -606,8 +610,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         self.prompt_lens_cuda_runtime = self.seq_lens_kv_cuda[:num_seqs]
         if not torch.cuda.is_current_stream_capturing():
             self.prompt_lens_cpu_runtime = self.seq_lens_kv[:num_seqs]
-        if self.num_tokens > 0:
-            self._populate_fp4_mla_batch_indices_positions()
+        self._update_fp4_mla_append_metadata()
 
     def update_helix_param(
         self,
@@ -1564,8 +1567,15 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         )
 
     def _ensure_rope_table_size(self, required_max_positions: int) -> None:
-        if required_max_positions > self.rope_params.max_positions:
-            self.rope_params.max_positions = required_max_positions
+        floats_per_position = self.rope_params.dim * (
+            2 if self.rope_params.duplicate_data else 1)
+        table_max_positions = (self.rotary_cos_sin.numel() //
+                               floats_per_position
+                               if self.rotary_cos_sin is not None
+                               and floats_per_position > 0 else 0)
+        if required_max_positions > table_max_positions:
+            self.rope_params.max_positions = max(required_max_positions,
+                                                 self.rope_params.max_positions)
             self.rotary_inv_freq, self.rotary_cos_sin = (
                 self.rope_params.create_rope_const_params())
 

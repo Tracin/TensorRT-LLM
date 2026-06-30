@@ -22,6 +22,7 @@ from tensorrt_llm._torch.attention_backend.fp4_mla import (
     _cutile_backend_available,
     _get_cutile_v_packed_cache,
     _maybe_update_cutile_v_packed_cache,
+    _snapshot_hp_kv_for_mtp_generation,
     get_fp4_mla_v_scale_pool_shape,
     get_fp4_mla_v_scale_pool_size,
     get_fp4_mla_v_scale_pool_view,
@@ -30,6 +31,7 @@ from tensorrt_llm._torch.attention_backend.fp4_mla import (
     scatter_fp4_mla_kv_cache,
     update_hp_kv_for_fp4_mla,
 )
+from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttention, TrtllmAttentionMetadata
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
@@ -808,6 +810,92 @@ def test_fp4_mla_hp_pool_restores_rejected_linear_mtp_tokens(preallocated_snapsh
         assert getattr(metadata, "_fp4_mla_mtp_hp_snapshots")
     else:
         assert getattr(metadata, "_fp4_mla_mtp_hp_snapshots") is None
+
+
+def test_fp4_mla_kv_lens_update_rebuilds_append_positions():
+    metadata = SimpleNamespace(
+        enable_flash_mla=False,
+        high_precision_kv_pool=object(),
+        num_contexts=0,
+        num_generations=1,
+        num_tokens=4,
+        batch_indices=torch.empty(4, dtype=torch.int32),
+        positions=torch.empty(4, dtype=torch.int32),
+        seq_lens_kv_cuda=torch.tensor([4], dtype=torch.int32),
+        kv_lens_cuda_runtime=torch.tensor([12], dtype=torch.int32),
+        prompt_lens_cuda_runtime=torch.tensor([4], dtype=torch.int32),
+    )
+    metadata._populate_fp4_mla_batch_indices_positions = lambda: (
+        TrtllmAttentionMetadata._populate_fp4_mla_batch_indices_positions(metadata)
+    )
+
+    TrtllmAttentionMetadata._update_fp4_mla_append_metadata(metadata)
+
+    torch.testing.assert_close(
+        metadata.positions,
+        torch.tensor([8, 9, 10, 11], dtype=torch.int32),
+    )
+
+
+@pytest.mark.parametrize("capturing", [False, True])
+def test_fp4_mla_warmup_snapshot_runs_only_during_cuda_graph_capture(monkeypatch, capturing):
+    head_dim = 2
+    gen_len = 4
+    pool = torch.arange(HP_BLOCK_SIZE * head_dim, dtype=torch.bfloat16).reshape(
+        1, 1, 1, HP_BLOCK_SIZE * head_dim
+    )
+    metadata = SimpleNamespace(
+        is_warmup=True,
+        fp4_mla_hp_snapshot_pool=torch.empty_like(pool),
+        batch_indices=torch.zeros(gen_len, dtype=torch.int32),
+        positions=torch.arange(gen_len, dtype=torch.int32),
+    )
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: capturing)
+
+    _snapshot_hp_kv_for_mtp_generation(
+        metadata,
+        pool,
+        local_layer=0,
+        num_gen=1,
+        num_gen_tokens=gen_len,
+        max_gen_len=gen_len,
+        metadata_token_offset=0,
+        head_dim=head_dim,
+        pool_head_dim=head_dim,
+    )
+
+    snapshots = getattr(metadata, "_fp4_mla_mtp_hp_snapshots", None)
+    if capturing:
+        assert snapshots[0]["mode"] == "pool"
+        torch.testing.assert_close(metadata.fp4_mla_hp_snapshot_pool, pool)
+    else:
+        assert snapshots is None
+
+
+def test_fp4_mla_rope_resize_checks_layer_table_capacity():
+    rope_params = SimpleNamespace(
+        dim=64,
+        duplicate_data=True,
+        max_positions=10,
+    )
+    rebuilt_tables = []
+
+    def create_rope_const_params():
+        table = torch.empty(rope_params.max_positions * rope_params.dim * 2)
+        rebuilt_tables.append(table)
+        return None, table
+
+    rope_params.create_rope_const_params = create_rope_const_params
+    attention = SimpleNamespace(
+        rope_params=rope_params,
+        rotary_inv_freq=None,
+        rotary_cos_sin=torch.empty(8 * rope_params.dim * 2),
+    )
+
+    TrtllmAttention._ensure_rope_table_size(attention, required_max_positions=10)
+
+    assert len(rebuilt_tables) == 1
+    assert attention.rotary_cos_sin.numel() == 10 * rope_params.dim * 2
 
 
 @pytest.mark.skipif(_is_pre_blackwell(), reason="requires Blackwell FP4 support")

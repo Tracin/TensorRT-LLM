@@ -325,6 +325,7 @@ class Fp4MlaFmha(PhasedFmha):
         qk_head_dim = qk_nope_head_dim + qk_rope_head_dim
         num_tokens = params.num_tokens
 
+        attn._ensure_rope_table_size(meta.max_seq_len)
         positions = meta.positions[:num_tokens]
         q_ctx = params.qkv_input.view(num_tokens, attn.num_heads, qk_head_dim)
         k_ctx = params.k_input.view(num_tokens, attn.num_heads, qk_head_dim)

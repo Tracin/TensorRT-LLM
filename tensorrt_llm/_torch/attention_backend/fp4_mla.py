@@ -2488,7 +2488,7 @@ def _snapshot_hp_kv_for_mtp_generation(
     head_dim: int,
     pool_head_dim: int,
 ) -> None:
-    if getattr(metadata, "is_warmup", False):
+    if getattr(metadata, "is_warmup", False) and not torch.cuda.is_current_stream_capturing():
         return
     if num_gen_tokens <= num_gen:
         return
