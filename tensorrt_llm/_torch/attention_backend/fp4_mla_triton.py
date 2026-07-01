@@ -653,7 +653,7 @@ def _fp4_mla_qk_scores_tile(
                 rhs_k_pack=True,
             )
 
-    return scores
+    return scores, safe_physical_page
 
 
 @triton.jit
@@ -668,6 +668,7 @@ def _fp4_mla_attention_page_stats_kernel(
     sf_cache_ptr,
     global_scale_ptr,
     q_global_scale_ptr,
+    global_scale_s0,
     src_page_ids_ptr,
     paged_kv_indptr_decode_ptr,
     kv_lens_ptr,
@@ -708,6 +709,7 @@ def _fp4_mla_attention_page_stats_kernel(
     ASSUME_FULL_HEADS: tl.constexpr,
     ASSUME_FULL_PAGES: tl.constexpr,
     ASSUME_VALID_PAGES: tl.constexpr,
+    KV_GLOBAL_SCALE_PER_PAGE: tl.constexpr,
     occupancy: tl.constexpr = 1,
 ):
     """Page-stats fused QK + softmax-stats + (optional) FP4 P pack.
@@ -753,7 +755,7 @@ def _fp4_mla_attention_page_stats_kernel(
             block_shape=[BLOCK_H, PAGE_SIZE // 2],
         )
     if ASSUME_FULL_PAGES or page_start < kv_len:
-        scores = _fp4_mla_qk_scores_tile(
+        scores, safe_physical_page = _fp4_mla_qk_scores_tile(
             q_fp4_ptr,
             q_sf_ptr,
             kv_cache_ptr,
@@ -793,11 +795,13 @@ def _fp4_mla_attention_page_stats_kernel(
             valid_t = tl.full([BLOCK_T], True, dtype=tl.int1)
         else:
             valid_t = page_start + offs_t < kv_len
-        global_scale = tl.load(global_scale_ptr)
-        # Static per-layer scales: QK encodes q * q_gscale and k * kv_gscale,
-        # so divide the scores by (q_gscale * kv_gscale). When Q and KV share
-        # one global scale, this reduces to global_scale^2.
-        # PV applies the final KV global_scale divisor separately.
+        if KV_GLOBAL_SCALE_PER_PAGE:
+            global_scale = tl.load(global_scale_ptr + safe_physical_page * global_scale_s0)
+        else:
+            global_scale = tl.load(global_scale_ptr)
+        # QK encodes q * q_gscale and k * kv_gscale, so divide the scores by
+        # their product. Dynamic mode selects kv_gscale from the physical page.
+        # PV removes that page's KV global scale separately.
         q_gscale = tl.load(q_global_scale_ptr)
         qk_scale = sm_scale / (q_gscale * global_scale)
         if ASSUME_FULL_HEADS and ASSUME_FULL_PAGES:
@@ -913,6 +917,7 @@ def _fp4_mla_attention_page_stats_grouped_kernel(
     sf_cache_ptr,
     global_scale_ptr,
     q_global_scale_ptr,
+    global_scale_s0,
     src_page_ids_ptr,
     paged_kv_indptr_decode_ptr,
     kv_lens_ptr,
@@ -952,6 +957,7 @@ def _fp4_mla_attention_page_stats_grouped_kernel(
     ASSUME_FULL_PAGES: tl.constexpr,
     ASSUME_VALID_PAGES: tl.constexpr,
     PAGE_LOOP_STAGES: tl.constexpr,
+    KV_GLOBAL_SCALE_PER_PAGE: tl.constexpr,
     occupancy: tl.constexpr = 1,
 ):
     """Grouped page-stats QK + softmax-stats + FP4 P pack.
@@ -985,9 +991,7 @@ def _fp4_mla_attention_page_stats_grouped_kernel(
         kv_len = tl.maximum(kv_len, 0)
     page_table_start = tl.load(paged_kv_indptr_decode_ptr + seq_idx).to(tl.int64)
 
-    global_scale = tl.load(global_scale_ptr)
     q_gscale = tl.load(q_global_scale_ptr)
-    qk_scale = sm_scale / (q_gscale * global_scale)
 
     residual_groups = Q_RESIDUAL_D // FP4_BLOCK
     non_residual_groups = K_HEAD_D // FP4_BLOCK - residual_groups
@@ -1094,6 +1098,12 @@ def _fp4_mla_attention_page_stats_grouped_kernel(
                         valid_compact_page & (physical_page >= 0) & (physical_page < num_pages)
                     )
                     safe_physical_page = tl.where(valid_physical_page, physical_page, 0)
+
+                if KV_GLOBAL_SCALE_PER_PAGE:
+                    global_scale = tl.load(global_scale_ptr + safe_physical_page * global_scale_s0)
+                else:
+                    global_scale = tl.load(global_scale_ptr)
+                qk_scale = sm_scale / (q_gscale * global_scale)
 
                 k_vals = k_desc.load([safe_physical_page.to(tl.int32), 0, 0])
                 k_vals = tl.reshape(k_vals, (BLOCK_T, BLOCK_K // 2))
@@ -1204,6 +1214,7 @@ def _fp4_mla_attention_page_stats_mtp_kernel(
     sf_cache_ptr,
     global_scale_ptr,
     q_global_scale_ptr,
+    global_scale_s0,
     src_page_ids_ptr,
     paged_kv_indptr_decode_ptr,
     kv_lens_ptr,
@@ -1239,6 +1250,7 @@ def _fp4_mla_attention_page_stats_mtp_kernel(
     BLOCK_K: tl.constexpr,
     FULL_BLOCK_END: tl.constexpr,
     TAIL_BLOCK_K: tl.constexpr,
+    KV_GLOBAL_SCALE_PER_PAGE: tl.constexpr,
     occupancy: tl.constexpr = 1,
 ):
     """MTP-fused page-stats: one CTA owns (seq, head_block, page) and processes
@@ -1262,9 +1274,7 @@ def _fp4_mla_attention_page_stats_mtp_kernel(
 
     kv_len_base = tl.load(kv_lens_ptr + seq_idx)
     page_table_start = tl.load(paged_kv_indptr_decode_ptr + seq_idx).to(tl.int64)
-    global_scale = tl.load(global_scale_ptr)
     q_gscale = tl.load(q_global_scale_ptr)
-    qk_scale = sm_scale / (q_gscale * global_scale)
 
     residual_groups = Q_RESIDUAL_D // FP4_BLOCK
     non_residual_groups = K_HEAD_D // FP4_BLOCK - residual_groups
@@ -1335,6 +1345,11 @@ def _fp4_mla_attention_page_stats_mtp_kernel(
     ).to(tl.int64)
     valid_physical_page = valid_compact_page & (physical_page >= 0) & (physical_page < num_pages)
     safe_physical_page = tl.where(valid_physical_page, physical_page, 0)
+    if KV_GLOBAL_SCALE_PER_PAGE:
+        global_scale = tl.load(global_scale_ptr + safe_physical_page * global_scale_s0)
+    else:
+        global_scale = tl.load(global_scale_ptr)
+    qk_scale = sm_scale / (q_gscale * global_scale)
 
     k_vals = k_desc.load([safe_physical_page.to(tl.int32), 0, 0])
     k_vals = tl.reshape(k_vals, (BLOCK_T, BLOCK_K // 2))
@@ -1631,6 +1646,7 @@ def _fp4_mla_attention_pv_kernel(
     v_packed_ptr,
     v_sf_ptr,
     global_scale_ptr,
+    global_scale_s0,
     src_page_ids_ptr,
     paged_kv_indptr_decode_ptr,
     kv_lens_ptr,
@@ -1665,6 +1681,7 @@ def _fp4_mla_attention_pv_kernel(
     ASSUME_FULL_PAGES: tl.constexpr,
     ASSUME_FULL_V: tl.constexpr,
     ASSUME_VALID_PAGES: tl.constexpr,
+    KV_GLOBAL_SCALE_PER_PAGE: tl.constexpr,
     PAGE_SPLIT: tl.constexpr = 1,
     PAGES_PER_SPLIT: tl.constexpr = 0,
     PARTIAL_OUT: tl.constexpr = False,
@@ -1761,8 +1778,11 @@ def _fp4_mla_attention_pv_kernel(
         kv_len = tl.load(kv_lens_ptr + seq_idx) - (QUERY_LEN_PER_SEQ - 1 - query_offset)
         kv_len = tl.maximum(kv_len, 0)
     page_table_start = tl.load(paged_kv_indptr_decode_ptr + seq_idx).to(tl.int64)
-    global_scale = tl.load(global_scale_ptr)
-    out_scale = 1.0 / (global_scale * P_GLOBAL_SCALE)
+    if KV_GLOBAL_SCALE_PER_PAGE:
+        out_scale = 1.0
+    else:
+        global_scale = tl.load(global_scale_ptr)
+        out_scale = 1.0 / (global_scale * P_GLOBAL_SCALE)
     acc = tl.zeros((BLOCK_H, BLOCK_V), dtype=tl.float32)
     if PAGE_SPLIT > 1:
         page_lo = split_idx * PAGES_PER_SPLIT
@@ -1870,21 +1890,44 @@ def _fp4_mla_attention_pv_kernel(
                 odd_nibble = tl.where(v_use_high_nibble[:, None], odd_packed >> 4, odd_low)
                 v_vals = even_nibble | (odd_nibble << 4)
             v_scales = tl.load(v_sf_ptr + safe_physical_page * vsf_s0 + v_sf_offsets)
-            acc = tl.dot_scaled(
-                p_vals,
-                p_scales,
-                "e2m1",
-                v_vals.T,
-                v_scales,
-                "e2m1",
-                acc=acc,
-                fast_math=True,
-                rhs_k_pack=True,
-            )
+            if KV_GLOBAL_SCALE_PER_PAGE:
+                if ASSUME_VALID_PAGES:
+                    page_global_scale = tl.load(
+                        global_scale_ptr + safe_physical_page * global_scale_s0
+                    )
+                else:
+                    page_global_scale = tl.load(
+                        global_scale_ptr + safe_physical_page * global_scale_s0,
+                        mask=valid_physical_page,
+                        other=1.0,
+                    )
+                page_acc = tl.dot_scaled(
+                    p_vals,
+                    p_scales,
+                    "e2m1",
+                    v_vals.T,
+                    v_scales,
+                    "e2m1",
+                    fast_math=True,
+                    rhs_k_pack=True,
+                )
+                acc += page_acc / (page_global_scale * P_GLOBAL_SCALE)
+            else:
+                acc = tl.dot_scaled(
+                    p_vals,
+                    p_scales,
+                    "e2m1",
+                    v_vals.T,
+                    v_scales,
+                    "e2m1",
+                    acc=acc,
+                    fast_math=True,
+                    rhs_k_pack=True,
+                )
 
     if PARTIAL_OUT:
-        # Write the unscaled partial accumulator to a float32 workspace; the
-        # reduce-PV kernel sums splits and applies out_scale + dtype cast.
+        # Dynamic mode has already removed each page's KV/P global scale.
+        # Static mode leaves the shared scale for the reduction kernel.
         # Layout: partial_out[query_idx, split_idx, head_offset, v_offset].
         base = (
             query_idx * partial_s0
@@ -1934,6 +1977,7 @@ def _fp4_mla_attention_pv_prepacked_v_kernel(
     v_packed_ptr,
     v_sf_ptr,
     global_scale_ptr,
+    global_scale_s0,
     src_page_ids_ptr,
     paged_kv_indptr_decode_ptr,
     kv_lens_ptr,
@@ -1964,6 +2008,7 @@ def _fp4_mla_attention_pv_prepacked_v_kernel(
     ASSUME_FULL_PAGES: tl.constexpr,
     ASSUME_FULL_V: tl.constexpr,
     ASSUME_VALID_PAGES: tl.constexpr,
+    KV_GLOBAL_SCALE_PER_PAGE: tl.constexpr,
     PAGE_SPLIT: tl.constexpr = 1,
     PAGES_PER_SPLIT: tl.constexpr = 0,
     PARTIAL_OUT: tl.constexpr = False,
@@ -2040,8 +2085,11 @@ def _fp4_mla_attention_pv_prepacked_v_kernel(
         kv_len = tl.load(kv_lens_ptr + seq_idx) - (QUERY_LEN_PER_SEQ - 1 - query_offset)
         kv_len = tl.maximum(kv_len, 0)
     page_table_start = tl.load(paged_kv_indptr_decode_ptr + seq_idx).to(tl.int64)
-    global_scale = tl.load(global_scale_ptr)
-    out_scale = 1.0 / (global_scale * P_GLOBAL_SCALE)
+    if KV_GLOBAL_SCALE_PER_PAGE:
+        out_scale = 1.0
+    else:
+        global_scale = tl.load(global_scale_ptr)
+        out_scale = 1.0 / (global_scale * P_GLOBAL_SCALE)
     acc = tl.zeros((BLOCK_V, BLOCK_H), dtype=tl.float32)
     if PAGE_SPLIT > 1:
         page_lo = split_idx * PAGES_PER_SPLIT
@@ -2097,17 +2145,40 @@ def _fp4_mla_attention_pv_prepacked_v_kernel(
             if not ASSUME_VALID_PAGES:
                 v_vals = tl.where(valid_physical_page, v_vals, 0)
             v_scales = tl.load(v_sf_ptr + safe_physical_page * vsf_s0 + v_sf_offsets)
-            acc = tl.dot_scaled(
-                v_vals,
-                v_scales,
-                "e2m1",
-                p_vals.T,
-                p_scales,
-                "e2m1",
-                acc=acc,
-                fast_math=True,
-                rhs_k_pack=True,
-            )
+            if KV_GLOBAL_SCALE_PER_PAGE:
+                if ASSUME_VALID_PAGES:
+                    page_global_scale = tl.load(
+                        global_scale_ptr + safe_physical_page * global_scale_s0
+                    )
+                else:
+                    page_global_scale = tl.load(
+                        global_scale_ptr + safe_physical_page * global_scale_s0,
+                        mask=valid_physical_page,
+                        other=1.0,
+                    )
+                page_acc = tl.dot_scaled(
+                    v_vals,
+                    v_scales,
+                    "e2m1",
+                    p_vals.T,
+                    p_scales,
+                    "e2m1",
+                    fast_math=True,
+                    rhs_k_pack=True,
+                )
+                acc += page_acc / (page_global_scale * P_GLOBAL_SCALE)
+            else:
+                acc = tl.dot_scaled(
+                    v_vals,
+                    v_scales,
+                    "e2m1",
+                    p_vals.T,
+                    p_scales,
+                    "e2m1",
+                    acc=acc,
+                    fast_math=True,
+                    rhs_k_pack=True,
+                )
 
     out_vals = acc.T
     if PARTIAL_OUT:
@@ -2168,6 +2239,7 @@ def _fp4_mla_attention_pv_reduce_kernel(
     BLOCK_V: tl.constexpr,
     ASSUME_FULL_HEADS: tl.constexpr,
     ASSUME_FULL_V: tl.constexpr,
+    KV_GLOBAL_SCALE_PER_PAGE: tl.constexpr,
     occupancy: tl.constexpr = 1,
 ):
     query_idx = tl.program_id(0)
@@ -2187,8 +2259,11 @@ def _fp4_mla_attention_pv_reduce_kernel(
     else:
         mask_v = offs_v < V_HEAD_D
         safe_offs_v = tl.where(mask_v, offs_v, 0)
-    global_scale = tl.load(global_scale_ptr)
-    out_scale = 1.0 / (global_scale * P_GLOBAL_SCALE)
+    if KV_GLOBAL_SCALE_PER_PAGE:
+        out_scale = 1.0
+    else:
+        global_scale = tl.load(global_scale_ptr)
+        out_scale = 1.0 / (global_scale * P_GLOBAL_SCALE)
     acc = tl.zeros((BLOCK_H, BLOCK_V), dtype=tl.float32)
     for split_idx in tl.static_range(0, PAGE_SPLIT):
         base = (

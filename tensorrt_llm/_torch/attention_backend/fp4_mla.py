@@ -4,10 +4,9 @@
 
 The high-precision (HP) BF16 KV pool is a standalone circular buffer used
 alongside the paged FP4 KV pool when MLA models run with NVFP4 KV cache.
-Each sequence slot stores the ``HP_BLOCK_SIZE`` most-recent latent vectors at
-BF16, so attention backends can consult BF16 values for the tail tokens that
-do not yet fill a complete FP4 quant block of 16 elements along the sequence
-dimension.
+Static scaling retains one 16-token quantization tile per sequence. Dynamic
+Triton scaling retains one 128-token page so a changed per-page KV scale can
+requantize every tile in that page.
 
 Used by the TRTLLM attention backend FP4 MLA FMHA path.
 """
@@ -20,6 +19,10 @@ import triton
 import triton.language as tl
 
 from .fp4_mla_kernels import (
+    _fp4_mla_context_page_amax_kernel,
+    _fp4_mla_context_page_scale_kernel,
+    _fp4_mla_generation_page_amax_kernel,
+    _fp4_mla_generation_page_scale_kernel,
     _fp4_mla_v_scale_store_context_tokens_kernel,
     _fp4_mla_v_scale_store_generation_tiles_kernel,
     _hp_kv_restore_rejected_from_pool_kernel,
@@ -31,6 +34,7 @@ from .fp4_mla_kernels import (
 HP_BLOCK_SIZE: int = 16
 FP4_BLOCK_SIZE: int = 16
 FP4_MLA_TOKENS_PER_BLOCK: int = 128
+FP4_MLA_DYNAMIC_HP_BLOCK_SIZE: int = FP4_MLA_TOKENS_PER_BLOCK
 FP4_MLA_SCALE_ROW_GROUP: int = 128
 FP4_MLA_SCALE_COL_GROUP: int = 4
 FP4_MLA_KV_GLOBAL_SCALE: float = 448.0 * 6.0 / 448 * 6.0
@@ -39,6 +43,7 @@ FP4_MLA_P_GLOBAL_SCALE: float = 448.0 * 6.0
 FP4_MLA_E4M3_MAX: float = 448.0
 FP4_MLA_Q_RESIDUAL_DIM: int = 64
 FP4_MLA_ATTENTION_BACKEND_ENV = "TRTLLM_FP4_MLA_ATTENTION_BACKEND"
+FP4_MLA_DYNAMIC_GLOBAL_SCALE_ENV = "TRTLLM_FP4_MLA_DYNAMIC_GLOBAL_SCALE"
 _HPUpdatePhase = Literal["all", "context", "generation"]
 _FP4_MLA_MTP_HP_SNAPSHOTS = "_fp4_mla_mtp_hp_snapshots"
 
@@ -67,6 +72,31 @@ def _env_int(name: str) -> Optional[int]:
 
 def _fp4_mla_attention_backend() -> str:
     return os.getenv(FP4_MLA_ATTENTION_BACKEND_ENV, "triton").lower()
+
+
+def fp4_mla_dynamic_global_scale_enabled() -> bool:
+    """Return whether dynamic per-tensor Q and per-page KV scales are enabled."""
+    return _env_enabled_default(FP4_MLA_DYNAMIC_GLOBAL_SCALE_ENV, False)
+
+
+def get_fp4_mla_hp_block_size() -> int:
+    """Return the HP tail size required by the selected FP4 MLA scale mode."""
+    if fp4_mla_dynamic_global_scale_enabled() and _fp4_mla_attention_backend() == "triton":
+        return FP4_MLA_DYNAMIC_HP_BLOCK_SIZE
+    return HP_BLOCK_SIZE
+
+
+def _validate_fp4_mla_dynamic_scale_backend() -> None:
+    if fp4_mla_dynamic_global_scale_enabled() and _fp4_mla_attention_backend() != "triton":
+        raise ValueError(
+            f"{FP4_MLA_DYNAMIC_GLOBAL_SCALE_ENV}=1 is supported only with "
+            f"{FP4_MLA_ATTENTION_BACKEND_ENV}=triton."
+        )
+
+
+def _get_fp4_mla_hp_block_size(metadata: Any) -> int:
+    hp_block_size = getattr(metadata, "fp4_mla_hp_block_size", None)
+    return get_fp4_mla_hp_block_size() if hp_block_size is None else int(hp_block_size)
 
 
 def _cutile_backend_available() -> bool:
@@ -174,14 +204,19 @@ def _get_fp4_mla_context_start_positions(metadata: Any, num_contexts: int) -> to
     )
 
 
-def _validate_fp4_mla_context_start_alignment(metadata: Any, num_contexts: int) -> None:
+def _validate_fp4_mla_context_start_alignment(
+    metadata: Any,
+    num_contexts: int,
+    *,
+    alignment: int = HP_BLOCK_SIZE,
+) -> None:
     context_start_positions = _get_fp4_mla_context_start_positions(metadata, num_contexts)
-    bad_start = (context_start_positions < 0) | ((context_start_positions % HP_BLOCK_SIZE) != 0)
+    bad_start = (context_start_positions < 0) | ((context_start_positions % alignment) != 0)
     if bool(torch.any(bad_start).item()):
         starts = context_start_positions.detach().cpu().tolist()
         raise ValueError(
             "FP4 MLA shared-tile context update requires every context "
-            f"start position to be {HP_BLOCK_SIZE}-token aligned, got "
+            f"start position to be {alignment}-token aligned, got "
             f"start positions {starts}."
         )
 
@@ -242,6 +277,38 @@ def get_fp4_mla_v_scale_pool_view(
     return torch.as_strided(pool, size=shape, stride=strides)
 
 
+def get_fp4_mla_kv_global_scale_pool_view(
+    metadata: Any,
+    *,
+    v_head_dim: int,
+) -> torch.Tensor:
+    """View one persistent FP32 KV global scale per layer and physical page.
+
+    The MLA V-scale allocation is sized from the full latent head dimension,
+    while the V layout consumes only ``v_head_dim``. Dynamic Triton scaling
+    stores its page scale in the first four otherwise-unused bytes per page.
+    """
+    pool = getattr(metadata, "fp4_mla_v_scale_pool", None)
+    if pool is None:
+        raise RuntimeError("FP4 MLA V scale pool is not allocated.")
+    if pool.element_size() != 1:
+        raise RuntimeError(
+            "FP4 MLA V scale pool must use one-byte elements, got "
+            f"element_size={pool.element_size()}."
+        )
+
+    scale_bytes = get_fp4_mla_v_scale_pool_size(v_head_dim, metadata.page_size)
+    required_bytes = scale_bytes + torch.float32.itemsize
+    if pool.shape[-1] < required_bytes:
+        raise RuntimeError(
+            "FP4 MLA V scale pool has no room for dynamic page scales: got "
+            f"{pool.shape[-1]} bytes per page, need {required_bytes}."
+        )
+
+    scale_storage = pool.view(torch.uint8)[..., scale_bytes:required_bytes]
+    return scale_storage.view(torch.float32).squeeze(-1)
+
+
 # Python launch helpers
 
 
@@ -262,6 +329,163 @@ def _get_fp4_mla_kv_cache_tensors(
     return kv_cache, sf_cache
 
 
+def _prepare_dynamic_context_kv_global_scales(
+    metadata: Any,
+    latent_cache: torch.Tensor,
+    *,
+    token_offset: int,
+    local_layer: int,
+    v_head_dim: int,
+    head_dim: int,
+) -> torch.Tensor:
+    num_tokens = latent_cache.shape[0]
+    num_dim_blocks = _ceil_div(head_dim, FP4_BLOCK_SIZE)
+    partial_amax = _ensure_workspace_tensor(
+        metadata,
+        "_fp4_mla_context_page_amax_buf",
+        (num_tokens, num_dim_blocks),
+        dtype=torch.float32,
+        device=latent_cache.device,
+    )
+    _fp4_mla_context_page_amax_kernel[(num_tokens, num_dim_blocks)](
+        partial_amax,
+        latent_cache,
+        metadata.batch_indices,
+        metadata.positions,
+        token_offset,
+        num_tokens,
+        metadata.batch_indices.shape[0],
+        partial_amax.stride(0),
+        partial_amax.stride(1),
+        latent_cache.stride(0),
+        latent_cache.stride(1),
+        HEAD_D=head_dim,
+        TOKEN_BLOCK=FP4_BLOCK_SIZE,
+        DIM_BLOCK=FP4_BLOCK_SIZE,
+    )
+
+    page_scales = get_fp4_mla_kv_global_scale_pool_view(metadata, v_head_dim=v_head_dim)[
+        local_layer
+    ]
+    _fp4_mla_context_page_scale_kernel[(num_tokens,)](
+        page_scales,
+        partial_amax,
+        metadata.batch_indices,
+        metadata.positions,
+        metadata.paged_kv_indices,
+        metadata.paged_kv_indptr,
+        token_offset,
+        num_tokens,
+        metadata.batch_indices.shape[0],
+        metadata.paged_kv_indices.shape[0],
+        metadata.paged_kv_indptr.shape[0],
+        page_scales.shape[0],
+        partial_amax.stride(0),
+        partial_amax.stride(1),
+        page_scales.stride(0),
+        metadata.page_size,
+        GLOBAL_SCALE_MAX=FP4_MLA_P_GLOBAL_SCALE,
+        NUM_DIM_BLOCKS=num_dim_blocks,
+        BLOCK_DIM_BLOCKS=triton.next_power_of_2(num_dim_blocks),
+        TILES_PER_PAGE=metadata.page_size // FP4_BLOCK_SIZE,
+    )
+    return page_scales
+
+
+def _prepare_dynamic_generation_kv_global_scales(
+    metadata: Any,
+    latent_cache: torch.Tensor,
+    kv_lens: torch.Tensor,
+    gen_lens: torch.Tensor,
+    page_ids: torch.Tensor,
+    *,
+    local_layer: int,
+    v_head_dim: int,
+    head_dim: int,
+    num_gen: int,
+    max_gen_len: int,
+) -> torch.Tensor:
+    hp_block_size = _get_fp4_mla_hp_block_size(metadata)
+    if hp_block_size != metadata.page_size:
+        raise RuntimeError(
+            "Dynamic FP4 MLA KV scaling requires one full page in the HP pool; "
+            f"got hp_block_size={hp_block_size}, page_size={metadata.page_size}."
+        )
+    if max_gen_len > hp_block_size:
+        raise NotImplementedError(
+            "Dynamic FP4 MLA KV scaling supports at most one page of generation "
+            f"tokens per sequence, got {max_gen_len}."
+        )
+
+    num_dim_blocks = _ceil_div(head_dim, FP4_BLOCK_SIZE)
+    tiles_per_page = metadata.page_size // FP4_BLOCK_SIZE
+    max_touched_pages = _ceil_div(max_gen_len + metadata.page_size - 1, metadata.page_size)
+    partial_amax = _ensure_workspace_tensor(
+        metadata,
+        "_fp4_mla_generation_page_amax_buf",
+        (num_gen, max_touched_pages, tiles_per_page, num_dim_blocks),
+        dtype=torch.float32,
+        device=latent_cache.device,
+    )
+    pool = metadata.high_precision_kv_pool
+    pool_head_dim = pool.shape[-1] // hp_block_size
+    _fp4_mla_generation_page_amax_kernel[
+        (num_gen, max_touched_pages, tiles_per_page * num_dim_blocks)
+    ](
+        partial_amax,
+        pool,
+        latent_cache,
+        metadata.seq_slots[metadata.num_contexts : metadata.num_seqs],
+        kv_lens,
+        gen_lens,
+        num_gen,
+        pool.shape[0],
+        pool.shape[1],
+        local_layer,
+        partial_amax.stride(0),
+        partial_amax.stride(1),
+        partial_amax.stride(2),
+        partial_amax.stride(3),
+        pool.stride(0),
+        pool.stride(1),
+        latent_cache.stride(0),
+        latent_cache.stride(1),
+        metadata.page_size,
+        HEAD_D=head_dim,
+        POOL_HEAD_D=pool_head_dim,
+        HP_POOL_SIZE=hp_block_size,
+        TOKEN_BLOCK=FP4_BLOCK_SIZE,
+        DIM_BLOCK=FP4_BLOCK_SIZE,
+        NUM_DIM_BLOCKS=num_dim_blocks,
+    )
+
+    page_scales = get_fp4_mla_kv_global_scale_pool_view(metadata, v_head_dim=v_head_dim)[
+        local_layer
+    ]
+    _fp4_mla_generation_page_scale_kernel[(num_gen, max_touched_pages)](
+        page_scales,
+        partial_amax,
+        kv_lens,
+        gen_lens,
+        page_ids,
+        metadata.paged_kv_indptr_decode,
+        page_ids.shape[0],
+        metadata.paged_kv_indptr_decode.shape[0],
+        page_scales.shape[0],
+        partial_amax.stride(0),
+        partial_amax.stride(1),
+        partial_amax.stride(2),
+        partial_amax.stride(3),
+        page_scales.stride(0),
+        metadata.page_size,
+        GLOBAL_SCALE_MAX=FP4_MLA_P_GLOBAL_SCALE,
+        NUM_DIM_BLOCKS=num_dim_blocks,
+        BLOCK_DIM_BLOCKS=triton.next_power_of_2(num_dim_blocks),
+        TILES_PER_PAGE=tiles_per_page,
+    )
+    return page_scales
+
+
 def _scatter_fp4_mla_kv_cache_2d_context(
     metadata: Any,
     latent_cache: torch.Tensor,
@@ -279,6 +503,7 @@ def _scatter_fp4_mla_kv_cache_2d_context(
     sf_per_token: int,
     sf_per_page: int,
 ) -> None:
+    dynamic_global_scale = fp4_mla_dynamic_global_scale_enabled()
     num_contexts = metadata.num_contexts
     if num_contexts > 0:
         prompt_lens_cpu = metadata.prompt_lens_cpu_runtime[:num_contexts]
@@ -288,7 +513,18 @@ def _scatter_fp4_mla_kv_cache_2d_context(
                 f"FP4 MLA 2D context scatter needs {ctx_token_count} context tokens, got "
                 f"{num_tokens}."
             )
-        _validate_fp4_mla_context_start_alignment(metadata, num_contexts)
+        alignment = metadata.page_size if dynamic_global_scale else FP4_BLOCK_SIZE
+        _validate_fp4_mla_context_start_alignment(metadata, num_contexts, alignment=alignment)
+
+    if dynamic_global_scale:
+        global_scale = _prepare_dynamic_context_kv_global_scales(
+            metadata,
+            latent_cache,
+            token_offset=token_offset,
+            local_layer=local_layer,
+            v_head_dim=v_head_dim,
+            head_dim=head_dim,
+        )
 
     _fp4_mla_v_scale_store_context_tokens_kernel[
         (
@@ -322,12 +558,14 @@ def _scatter_fp4_mla_kv_cache_2d_context(
         latent_cache.stride(1),
         v_sf.stride(0),
         v_sf.stride(1),
+        global_scale.stride(0),
         HEAD_D=head_dim,
         V_HEAD_D=v_head_dim,
-        HP_BLOCK=HP_BLOCK_SIZE,
+        HP_BLOCK=FP4_BLOCK_SIZE,
         FP4_BLOCK=FP4_BLOCK_SIZE,
         SF_PER_TOKEN=sf_per_token,
         SF_PER_PAGE=sf_per_page,
+        KV_GLOBAL_SCALE_PER_PAGE=dynamic_global_scale,
     )
 
 
@@ -400,7 +638,8 @@ def _scatter_fp4_mla_kv_cache_2d_generation(
     pool = getattr(metadata, "high_precision_kv_pool", None)
     if pool is None:
         raise RuntimeError("FP4 MLA 2D generation scatter requires the HP KV pool.")
-    hp_head_dim = pool.shape[-1] // HP_BLOCK_SIZE
+    hp_block_size = _get_fp4_mla_hp_block_size(metadata)
+    hp_head_dim = pool.shape[-1] // hp_block_size
     if hp_head_dim < head_dim:
         raise RuntimeError(
             f"FP4 MLA 2D generation scatter needs at least {head_dim} HP channels, got "
@@ -408,8 +647,24 @@ def _scatter_fp4_mla_kv_cache_2d_generation(
         )
 
     max_gen_len = num_tokens // num_gen
-    max_gen_tiles = _ceil_div(max_gen_len + HP_BLOCK_SIZE - 1, HP_BLOCK_SIZE)
     page_ids = metadata.paged_kv_indices[metadata.num_context_blocks :]
+    dynamic_global_scale = fp4_mla_dynamic_global_scale_enabled()
+    if dynamic_global_scale:
+        global_scale = _prepare_dynamic_generation_kv_global_scales(
+            metadata,
+            latent_cache,
+            kv_lens_gen,
+            gen_lens_gen,
+            page_ids,
+            local_layer=local_layer,
+            v_head_dim=v_head_dim,
+            head_dim=head_dim,
+            num_gen=num_gen,
+            max_gen_len=max_gen_len,
+        )
+        max_gen_tiles = _ceil_div(max_gen_len + metadata.page_size - 1, FP4_BLOCK_SIZE)
+    else:
+        max_gen_tiles = _ceil_div(max_gen_len + FP4_BLOCK_SIZE - 1, FP4_BLOCK_SIZE)
     _fp4_mla_v_scale_store_generation_tiles_kernel[
         (
             num_gen,
@@ -445,12 +700,16 @@ def _scatter_fp4_mla_kv_cache_2d_generation(
         latent_cache.stride(1),
         v_sf.stride(0),
         v_sf.stride(1),
+        global_scale.stride(0),
         HEAD_D=hp_head_dim,
         V_HEAD_D=v_head_dim,
-        HP_BLOCK=HP_BLOCK_SIZE,
+        HP_BLOCK=FP4_BLOCK_SIZE,
+        HP_POOL_SIZE=hp_block_size,
         FP4_BLOCK=FP4_BLOCK_SIZE,
         SF_PER_TOKEN=sf_per_token,
         SF_PER_PAGE=sf_per_page,
+        REWRITE_PAGE=dynamic_global_scale,
+        KV_GLOBAL_SCALE_PER_PAGE=dynamic_global_scale,
     )
 
 
@@ -489,6 +748,8 @@ def scatter_fp4_mla_kv_cache(
     if latent_cache is None or latent_cache.numel() == 0:
         return
 
+    _validate_fp4_mla_dynamic_scale_backend()
+
     latent_cache = latent_cache.reshape(latent_cache.shape[0], -1).contiguous()
     num_tokens = latent_cache.shape[0]
     head_dim = latent_cache.shape[-1]
@@ -520,10 +781,10 @@ def scatter_fp4_mla_kv_cache(
         raise RuntimeError("FP4 MLA scatter requires the auxiliary V scale pool.")
     if local_layer is None or v_head_dim is None:
         raise ValueError("FP4 MLA scatter requires local_layer and v_head_dim.")
-    if metadata.page_size % HP_BLOCK_SIZE != 0:
+    if metadata.page_size % FP4_BLOCK_SIZE != 0:
         raise ValueError(
             f"FP4 MLA scatter requires page_size divisible by "
-            f"{HP_BLOCK_SIZE}, got {metadata.page_size}."
+            f"{FP4_BLOCK_SIZE}, got {metadata.page_size}."
         )
     if v_head_dim > head_dim:
         raise ValueError(f"FP4 MLA v_head_dim={v_head_dim} cannot exceed head_dim={head_dim}.")
@@ -535,7 +796,7 @@ def scatter_fp4_mla_kv_cache(
     sf_cache = sf_cache.view(torch.float8_e4m3fn)
     v_sf = get_fp4_mla_v_scale_pool_view(metadata, v_head_dim=v_head_dim)
     num_dim_blocks = triton.cdiv(head_dim, FP4_BLOCK_SIZE)
-    sf_per_page = metadata.page_size // HP_BLOCK_SIZE
+    sf_per_page = metadata.page_size // FP4_BLOCK_SIZE
 
     if phase == "context":
         _scatter_fp4_mla_kv_cache_2d_context(
@@ -661,6 +922,15 @@ def _ensure_workspace_tensor(
 
     slices = tuple(slice(0, dim) for dim in shape)
     return tensor[slices]
+
+
+def _dynamic_fp4_mla_q_scale(q: torch.Tensor) -> torch.Tensor:
+    q_amax = torch.amax(torch.abs(q).to(torch.float32))
+    return torch.where(
+        q_amax > 0.0,
+        FP4_MLA_P_GLOBAL_SCALE / torch.clamp_min(q_amax, 1.0e-12),
+        torch.ones_like(q_amax),
+    ).reshape(1)
 
 
 def _cutile_persistent_v_pack_enabled() -> bool:
@@ -1329,6 +1599,7 @@ def _run_triton_attention_decode(
     max_pages: int,
     sm_scale: float,
     q_global_scale: Optional[torch.Tensor] = None,
+    kv_global_scale_per_page: bool = False,
 ) -> None:
     """Dispatch the ``triton`` FP4 MLA decode pipeline.
 
@@ -1481,8 +1752,8 @@ def _run_triton_attention_decode(
     )
 
     pack_prob_in_page_stats = True
-    # Q and KV share the same static global scale, so this reduces to the
-    # global_scale^2 correction.
+    # Static mode shares one Q/KV scale. Dynamic mode supplies one Q scale and
+    # indexes the KV scale by physical page inside the Triton kernels.
     page_stats_q_gscale = q_global_scale if q_global_scale is not None else global_scale
 
     # Grouped page-stats: walk multiple pages per CTA so Q (and the TMA
@@ -1545,6 +1816,7 @@ def _run_triton_attention_decode(
             sf_cache,
             global_scale,
             page_stats_q_gscale,
+            global_scale.stride(0),
             src_page_ids,
             metadata.paged_kv_indptr_decode,
             kv_lens,
@@ -1580,6 +1852,7 @@ def _run_triton_attention_decode(
             BLOCK_K=block_k,
             FULL_BLOCK_END=full_block_end,
             TAIL_BLOCK_K=tail_block_k,
+            KV_GLOBAL_SCALE_PER_PAGE=kv_global_scale_per_page,
             **mtp_launch_meta,
         )
     elif can_group_page_stats:
@@ -1613,6 +1886,7 @@ def _run_triton_attention_decode(
             sf_cache,
             global_scale,
             page_stats_q_gscale,
+            global_scale.stride(0),
             src_page_ids,
             metadata.paged_kv_indptr_decode,
             kv_lens,
@@ -1652,6 +1926,7 @@ def _run_triton_attention_decode(
             ASSUME_FULL_PAGES=assume_full_pages,
             ASSUME_VALID_PAGES=assume_valid_pages,
             PAGE_LOOP_STAGES=ps_loop_stages,
+            KV_GLOBAL_SCALE_PER_PAGE=kv_global_scale_per_page,
             **page_stats_launch_meta,
         )
     else:
@@ -1666,6 +1941,7 @@ def _run_triton_attention_decode(
             sf_cache,
             global_scale,
             page_stats_q_gscale,
+            global_scale.stride(0),
             src_page_ids,
             metadata.paged_kv_indptr_decode,
             kv_lens,
@@ -1706,6 +1982,7 @@ def _run_triton_attention_decode(
             ASSUME_FULL_HEADS=assume_full_heads,
             ASSUME_FULL_PAGES=assume_full_pages,
             ASSUME_VALID_PAGES=assume_valid_pages,
+            KV_GLOBAL_SCALE_PER_PAGE=kv_global_scale_per_page,
             **page_stats_launch_meta,
         )
     # Two-level softmax-stats reduction. The single-level reduce launched only
@@ -1910,6 +2187,7 @@ def _run_triton_attention_decode(
                 v_packed,
                 v_sf,
                 global_scale,
+                global_scale.stride(0),
                 src_page_ids,
                 metadata.paged_kv_indptr_decode,
                 kv_lens,
@@ -1943,6 +2221,7 @@ def _run_triton_attention_decode(
                 PAGE_SPLIT=page_split,
                 PAGES_PER_SPLIT=pages_per_split,
                 PARTIAL_OUT=True,
+                KV_GLOBAL_SCALE_PER_PAGE=kv_global_scale_per_page,
                 partial_out_ptr=partial_out,
                 partial_s0=partial_out.stride(0),
                 partial_s1=partial_out.stride(1),
@@ -1959,6 +2238,7 @@ def _run_triton_attention_decode(
                 kv_cache,
                 v_sf,
                 global_scale,
+                global_scale.stride(0),
                 src_page_ids,
                 metadata.paged_kv_indptr_decode,
                 kv_lens,
@@ -1996,6 +2276,7 @@ def _run_triton_attention_decode(
                 PAGE_SPLIT=page_split,
                 PAGES_PER_SPLIT=pages_per_split,
                 PARTIAL_OUT=True,
+                KV_GLOBAL_SCALE_PER_PAGE=kv_global_scale_per_page,
                 partial_out_ptr=partial_out,
                 partial_s0=partial_out.stride(0),
                 partial_s1=partial_out.stride(1),
@@ -2022,6 +2303,7 @@ def _run_triton_attention_decode(
             BLOCK_V=block_v,
             ASSUME_FULL_HEADS=assume_full_heads,
             ASSUME_FULL_V=assume_full_v,
+            KV_GLOBAL_SCALE_PER_PAGE=kv_global_scale_per_page,
             **launch_meta,
         )
     else:
@@ -2033,6 +2315,7 @@ def _run_triton_attention_decode(
                 v_packed,
                 v_sf,
                 global_scale,
+                global_scale.stride(0),
                 src_page_ids,
                 metadata.paged_kv_indptr_decode,
                 kv_lens,
@@ -2063,6 +2346,7 @@ def _run_triton_attention_decode(
                 ASSUME_FULL_PAGES=assume_full_pages,
                 ASSUME_FULL_V=assume_full_v,
                 ASSUME_VALID_PAGES=assume_valid_pages,
+                KV_GLOBAL_SCALE_PER_PAGE=kv_global_scale_per_page,
                 **pv_launch_meta,
             )
         else:
@@ -2074,6 +2358,7 @@ def _run_triton_attention_decode(
                 kv_cache,
                 v_sf,
                 global_scale,
+                global_scale.stride(0),
                 src_page_ids,
                 metadata.paged_kv_indptr_decode,
                 kv_lens,
@@ -2108,6 +2393,7 @@ def _run_triton_attention_decode(
                 ASSUME_FULL_PAGES=assume_full_pages,
                 ASSUME_FULL_V=assume_full_v,
                 ASSUME_VALID_PAGES=assume_valid_pages,
+                KV_GLOBAL_SCALE_PER_PAGE=kv_global_scale_per_page,
                 **pv_launch_meta,
             )
 
@@ -2170,6 +2456,9 @@ def run_fp4_mla_attention_decode(
             "FP4 MLA attention decode requires the auxiliary V scale pool to be allocated."
         )
 
+    backend = _fp4_mla_attention_backend()
+    _validate_fp4_mla_dynamic_scale_backend()
+    dynamic_global_scale = fp4_mla_dynamic_global_scale_enabled()
     global_scale = _get_fp4_mla_global_scale(metadata, q_nope.device)
     q_residual_dim = FP4_MLA_Q_RESIDUAL_DIM
     _validate_fp4_mla_attention_q_shape(head_dim, q_residual_dim)
@@ -2188,10 +2477,22 @@ def run_fp4_mla_attention_decode(
         raise TypeError(
             f"FP4 MLA residual Q quantization requires BF16 or FP8 Q; got {q_2d.dtype}."
         )
-    backend = _fp4_mla_attention_backend()
-    q_global_scale = global_scale
+    q_quant_input = q_2d
+    if dynamic_global_scale:
+        if q_2d.dtype == torch.float8_e4m3fn:
+            q_quant_input = _ensure_workspace_tensor(
+                metadata,
+                "_fp4_mla_attention_q_bf16_buf",
+                q_2d.shape,
+                dtype=torch.bfloat16,
+                device=q_2d.device,
+            )
+            q_quant_input.copy_(q_2d)
+        q_global_scale = _dynamic_fp4_mla_q_scale(q_quant_input)
+    else:
+        q_global_scale = global_scale
     q_fp4, q_sf = torch.ops.trtllm.fp4_quantize_with_residual(
-        q_2d,
+        q_quant_input,
         q_global_scale,
         q_residual_dim,
         is_act=True,
@@ -2205,6 +2506,10 @@ def run_fp4_mla_attention_decode(
     v_sf = get_fp4_mla_v_scale_pool_view(metadata, v_head_dim=kv_lora_rank)[local_layer].view(
         torch.float8_e4m3fn
     )
+    if dynamic_global_scale:
+        global_scale = get_fp4_mla_kv_global_scale_pool_view(metadata, v_head_dim=kv_lora_rank)[
+            local_layer
+        ]
 
     src_page_ids = metadata.paged_kv_indices[
         metadata.num_context_blocks : metadata.num_context_blocks + num_gen_blocks
@@ -2465,6 +2770,7 @@ def run_fp4_mla_attention_decode(
         max_pages=max_pages,
         sm_scale=float(sm_scale),
         q_global_scale=q_global_scale,
+        kv_global_scale_per_page=dynamic_global_scale,
     )
 
 
@@ -2472,8 +2778,9 @@ def _hp_pool_layer_view(
     pool: torch.Tensor,
     local_layer: int,
     pool_head_dim: int,
+    hp_block_size: int,
 ) -> torch.Tensor:
-    return pool[:, local_layer, 0, :].view(pool.shape[0], HP_BLOCK_SIZE, pool_head_dim)
+    return pool[:, local_layer, 0, :].view(pool.shape[0], hp_block_size, pool_head_dim)
 
 
 def _snapshot_hp_kv_for_mtp_generation(
@@ -2488,14 +2795,15 @@ def _snapshot_hp_kv_for_mtp_generation(
     head_dim: int,
     pool_head_dim: int,
 ) -> None:
+    hp_block_size = _get_fp4_mla_hp_block_size(metadata)
     if getattr(metadata, "is_warmup", False) and not torch.cuda.is_current_stream_capturing():
         return
     if num_gen_tokens <= num_gen:
         return
-    if max_gen_len > HP_BLOCK_SIZE:
+    if max_gen_len > hp_block_size:
         raise NotImplementedError(
             "FP4 MLA HP-pool rollback for linear MTP supports at most "
-            f"{HP_BLOCK_SIZE} generation tokens per sequence, got {max_gen_len}."
+            f"{hp_block_size} generation tokens per sequence, got {max_gen_len}."
         )
 
     end_token_offset = metadata_token_offset + num_gen_tokens
@@ -2524,6 +2832,7 @@ def _snapshot_hp_kv_for_mtp_generation(
             "num_gen_tokens": num_gen_tokens,
             "head_dim": head_dim,
             "pool_head_dim": pool_head_dim,
+            "hp_block_size": hp_block_size,
         }
         return
 
@@ -2537,11 +2846,11 @@ def _snapshot_hp_kv_for_mtp_generation(
     batch_indices = metadata.batch_indices[token_indices].to(torch.long)
     positions = metadata.positions[token_indices].to(torch.long)
     seq_slots = metadata.seq_slots[batch_indices].to(torch.long)
-    hp_slots = torch.remainder(positions, HP_BLOCK_SIZE).to(torch.long)
+    hp_slots = torch.remainder(positions, hp_block_size).to(torch.long)
     first_new_positions = metadata.kv_lens_cuda_runtime[batch_indices].to(
         torch.long
     ) - metadata.prompt_lens_cuda_runtime[batch_indices].to(torch.long)
-    pool_view = _hp_pool_layer_view(pool, local_layer, pool_head_dim)
+    pool_view = _hp_pool_layer_view(pool, local_layer, pool_head_dim, hp_block_size)
     values = pool_view[seq_slots, hp_slots, :head_dim].clone()
 
     snapshots[int(local_layer)] = {
@@ -2554,6 +2863,7 @@ def _snapshot_hp_kv_for_mtp_generation(
         "values": values,
         "head_dim": head_dim,
         "pool_head_dim": pool_head_dim,
+        "hp_block_size": hp_block_size,
     }
 
 
@@ -2580,6 +2890,7 @@ def repair_fp4_mla_hp_kv_for_mtp_rejection(
         for local_layer, snapshot in snapshots.items():
             head_dim = snapshot["head_dim"]
             pool_head_dim = snapshot["pool_head_dim"]
+            hp_block_size = snapshot.get("hp_block_size", HP_BLOCK_SIZE)
             block_d = triton.next_power_of_2(head_dim)
             if snapshot.get("mode") == "pool":
                 keep_snapshots = True
@@ -2607,7 +2918,7 @@ def repair_fp4_mla_hp_kv_for_mtp_rejection(
                     D=head_dim,
                     POOL_HEAD_D=pool_head_dim,
                     BLOCK_D=block_d,
-                    HP_BLOCK=HP_BLOCK_SIZE,
+                    HP_BLOCK=hp_block_size,
                 )
             else:
                 positions = snapshot["positions"]
@@ -2638,7 +2949,7 @@ def repair_fp4_mla_hp_kv_for_mtp_rejection(
                     D=head_dim,
                     POOL_HEAD_D=pool_head_dim,
                     BLOCK_D=block_d,
-                    HP_BLOCK=HP_BLOCK_SIZE,
+                    HP_BLOCK=hp_block_size,
                 )
     finally:
         if not keep_snapshots:
@@ -2655,14 +2966,14 @@ def update_hp_kv_for_fp4_mla(
     """Store recent KV tokens at BF16 into the high-precision pool.
 
     Called on every layer before the attention kernel. The pool acts as a
-    circular buffer of HP_BLOCK_SIZE slots per sequence:
+    circular buffer of ``fp4_mla_hp_block_size`` slots per sequence:
 
-    Context phase stores the last ``kv_len % HP_BLOCK_SIZE`` new tokens of
+    Context phase stores the last ``kv_len % fp4_mla_hp_block_size`` new tokens of
         each request into buffer positions [0, remainder). These are the
         tail tokens that do not fill a complete FP4 block of 16.
 
     Generation phase stores every new token for each request into position
-        ``position % HP_BLOCK_SIZE``, overwriting the oldest entries in the
+        ``position % fp4_mla_hp_block_size``, overwriting the oldest entries in the
         circular buffer.  This supports linear MTP where a request contributes
         more than one generation token in a forward pass.
 
@@ -2701,7 +3012,8 @@ def update_hp_kv_for_fp4_mla(
     # ------------------------------------------------------------------
     pool = metadata.high_precision_kv_pool
     head_dim = latent_cache.shape[-1]
-    pool_head_dim = pool.shape[-1] // HP_BLOCK_SIZE
+    hp_block_size = _get_fp4_mla_hp_block_size(metadata)
+    pool_head_dim = pool.shape[-1] // hp_block_size
     if pool_head_dim < head_dim:
         raise RuntimeError(
             f"FP4 MLA HP pool head dimension is too small: got "
@@ -2712,7 +3024,7 @@ def update_hp_kv_for_fp4_mla(
     pool_s1 = pool.stride(1)  # stride across layers
     lc_stride = latent_cache.stride(0)
 
-    # Context phase: store last (kv_len % HP_BLOCK_SIZE) new tokens.
+    # Context phase: store the current HP-window tail tokens.
     if update_context and num_contexts > 0:
         prompt_lens_cpu = metadata.prompt_lens_cpu_runtime[:num_contexts]
         # Exclusive prefix sum: token offset in latent_cache for each ctx seq.
@@ -2721,7 +3033,7 @@ def update_hp_kv_for_fp4_mla(
             token_offsets_cpu[1:].copy_(torch.cumsum(prompt_lens_cpu[:-1].to(torch.int32), dim=0))
         token_offsets_gpu = token_offsets_cpu.to(pool.device, non_blocking=False)
         prompt_lens_gpu = metadata.prompt_lens_cuda_runtime[:num_contexts]
-        _hp_kv_store_context_kernel[(num_contexts, HP_BLOCK_SIZE)](
+        _hp_kv_store_context_kernel[(num_contexts, hp_block_size)](
             pool,
             latent_cache,
             metadata.seq_slots,
@@ -2737,10 +3049,10 @@ def update_hp_kv_for_fp4_mla(
             D=head_dim,
             POOL_HEAD_D=pool_head_dim,
             BLOCK_D=block_d,
-            HP_BLOCK=HP_BLOCK_SIZE,
+            HP_BLOCK=hp_block_size,
         )
 
-    # Generation phase: store current tokens at position % HP_BLOCK_SIZE.
+    # Generation phase: store current tokens at position % hp_block_size.
     num_gen = num_seqs - num_contexts
     if update_generation and num_gen > 0:
         gen_tok_start = 0
@@ -2796,5 +3108,5 @@ def update_hp_kv_for_fp4_mla(
             D=head_dim,
             POOL_HEAD_D=pool_head_dim,
             BLOCK_D=block_d,
-            HP_BLOCK=HP_BLOCK_SIZE,
+            HP_BLOCK=hp_block_size,
         )

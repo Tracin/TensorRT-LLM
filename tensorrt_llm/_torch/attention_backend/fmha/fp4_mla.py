@@ -21,8 +21,8 @@ import torch.nn.functional as F
 from tensorrt_llm._torch.attention_backend.fp4_mla import (
     FP4_MLA_Q_RESIDUAL_DIM,
     FP4_MLA_TOKENS_PER_BLOCK,
-    HP_BLOCK_SIZE,
     apply_fp4_mla_rope,
+    get_fp4_mla_hp_block_size,
     run_fp4_mla_attention_decode,
     scatter_fp4_mla_kv_cache,
     update_hp_kv_for_fp4_mla,
@@ -64,7 +64,7 @@ class Fp4MlaFmha(PhasedFmha):
         if attn.attention_chunk_size not in (None, 0):
             logger.debug("FP4 MLA FMHA is unavailable: chunked attention is not supported.")
             return False
-        if attn.predicted_tokens_per_seq > HP_BLOCK_SIZE:
+        if attn.predicted_tokens_per_seq > get_fp4_mla_hp_block_size():
             logger.debug(
                 "FP4 MLA FMHA is unavailable: linear MTP length exceeds "
                 "FP4 MLA HP rollback support."

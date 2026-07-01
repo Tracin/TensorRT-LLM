@@ -353,6 +353,301 @@ def _fp4_e2m1_quantize(x):
 
 
 @triton.jit
+def _fp4_mla_context_page_amax_kernel(
+    partial_amax_ptr,
+    latent_cache_ptr,
+    batch_indices_ptr,
+    positions_ptr,
+    token_offset,
+    num_tokens,
+    metadata_num_tokens,
+    partial_s0,
+    partial_s1,
+    lc_s0,
+    lc_s1,
+    HEAD_D: tl.constexpr,
+    TOKEN_BLOCK: tl.constexpr,
+    DIM_BLOCK: tl.constexpr,
+):
+    """Compute one 16-token by 16-channel amax partial for context."""
+    token_idx = tl.program_id(0)
+    dim_block = tl.program_id(1)
+    metadata_token_idx = token_offset + token_idx
+    valid_start = (token_idx < num_tokens) & (metadata_token_idx < metadata_num_tokens)
+    batch_idx = tl.load(batch_indices_ptr + metadata_token_idx, mask=valid_start, other=-1).to(
+        tl.int64
+    )
+    position = tl.load(positions_ptr + metadata_token_idx, mask=valid_start, other=-1).to(tl.int64)
+    valid_start &= (batch_idx >= 0) & (position >= 0) & (position % TOKEN_BLOCK == 0)
+
+    token_offsets = tl.arange(0, TOKEN_BLOCK)
+    dim_offsets = dim_block * DIM_BLOCK + tl.arange(0, DIM_BLOCK)
+    token_candidates = token_idx + token_offsets
+    metadata_candidates = token_offset + token_candidates
+    valid_tokens = valid_start & (token_candidates < num_tokens)
+    valid_tokens &= metadata_candidates < metadata_num_tokens
+    safe_metadata_candidates = tl.where(valid_tokens, metadata_candidates, 0)
+    candidate_batches = tl.load(
+        batch_indices_ptr + safe_metadata_candidates, mask=valid_tokens, other=-1
+    ).to(tl.int64)
+    candidate_positions = tl.load(
+        positions_ptr + safe_metadata_candidates, mask=valid_tokens, other=-1
+    ).to(tl.int64)
+    valid_tokens &= candidate_batches == batch_idx
+    valid_tokens &= candidate_positions == position + token_offsets
+    valid_dims = dim_offsets < HEAD_D
+    safe_tokens = tl.where(valid_tokens, token_candidates, 0).to(tl.int64)
+    safe_dims = tl.where(valid_dims, dim_offsets, 0)
+    values = tl.load(
+        latent_cache_ptr + safe_tokens[:, None] * lc_s0 + safe_dims[None, :] * lc_s1,
+        mask=valid_tokens[:, None] & valid_dims[None, :],
+        other=0.0,
+    ).to(tl.float32)
+    tile_amax = tl.max(tl.max(tl.abs(values), axis=1), axis=0)
+    tl.store(
+        partial_amax_ptr + token_idx * partial_s0 + dim_block * partial_s1,
+        tl.where(valid_start, tile_amax, 0.0),
+    )
+
+
+@triton.jit
+def _fp4_mla_context_page_scale_kernel(
+    page_scale_ptr,
+    partial_amax_ptr,
+    batch_indices_ptr,
+    positions_ptr,
+    page_ids_ptr,
+    paged_kv_indptr_ptr,
+    token_offset,
+    num_tokens,
+    metadata_num_tokens,
+    page_ids_len,
+    indptr_len,
+    num_pages,
+    partial_s0,
+    partial_s1,
+    page_scale_s0,
+    page_size,
+    GLOBAL_SCALE_MAX: tl.constexpr,
+    NUM_DIM_BLOCKS: tl.constexpr,
+    BLOCK_DIM_BLOCKS: tl.constexpr,
+    TILES_PER_PAGE: tl.constexpr,
+):
+    """Reduce context tile partials and persist one global scale per page."""
+    token_idx = tl.program_id(0)
+    metadata_token_idx = token_offset + token_idx
+    if (token_idx >= num_tokens) | (metadata_token_idx >= metadata_num_tokens):
+        return
+    batch_idx = tl.load(batch_indices_ptr + metadata_token_idx).to(tl.int64)
+    position = tl.load(positions_ptr + metadata_token_idx).to(tl.int64)
+    if (
+        (batch_idx < 0)
+        | (batch_idx + 1 >= indptr_len)
+        | (position < 0)
+        | (position % page_size != 0)
+    ):
+        return
+
+    tile_offsets = tl.arange(0, TILES_PER_PAGE)
+    dim_blocks = tl.arange(0, BLOCK_DIM_BLOCKS)
+    token_candidates = token_idx + tile_offsets * (page_size // TILES_PER_PAGE)
+    metadata_candidates = token_offset + token_candidates
+    valid_tiles = (token_candidates < num_tokens) & (metadata_candidates < metadata_num_tokens)
+    safe_metadata_candidates = tl.where(valid_tiles, metadata_candidates, 0)
+    candidate_batches = tl.load(
+        batch_indices_ptr + safe_metadata_candidates, mask=valid_tiles, other=-1
+    ).to(tl.int64)
+    candidate_positions = tl.load(
+        positions_ptr + safe_metadata_candidates, mask=valid_tiles, other=-1
+    ).to(tl.int64)
+    valid_tiles &= candidate_batches == batch_idx
+    valid_tiles &= candidate_positions == position + tile_offsets * (page_size // TILES_PER_PAGE)
+    valid_dims = dim_blocks < NUM_DIM_BLOCKS
+    safe_tokens = tl.where(valid_tiles, token_candidates, 0).to(tl.int64)
+    partials = tl.load(
+        partial_amax_ptr + safe_tokens[:, None] * partial_s0 + dim_blocks[None, :] * partial_s1,
+        mask=valid_tiles[:, None] & valid_dims[None, :],
+        other=0.0,
+    )
+    page_amax = tl.max(tl.max(partials, axis=1), axis=0)
+
+    page_idx = position // page_size
+    page_table_start = tl.load(paged_kv_indptr_ptr + batch_idx).to(tl.int64)
+    page_table_end = tl.load(paged_kv_indptr_ptr + batch_idx + 1).to(tl.int64)
+    compact_page = page_table_start + page_idx
+    valid_compact_page = (
+        (compact_page >= page_table_start)
+        & (compact_page < page_table_end)
+        & (compact_page >= 0)
+        & (compact_page < page_ids_len)
+    )
+    physical_page = tl.load(page_ids_ptr + compact_page, mask=valid_compact_page, other=-1).to(
+        tl.int64
+    )
+    valid_page = valid_compact_page & (physical_page >= 0) & (physical_page < num_pages)
+    page_scale = tl.where(page_amax > 0.0, GLOBAL_SCALE_MAX / tl.maximum(page_amax, 1.0e-12), 1.0)
+    tl.store(page_scale_ptr + physical_page * page_scale_s0, page_scale, mask=valid_page)
+
+
+@triton.jit
+def _fp4_mla_generation_page_amax_kernel(
+    partial_amax_ptr,
+    hp_pool_ptr,
+    latent_cache_ptr,
+    seq_slots_ptr,
+    kv_lens_ptr,
+    gen_lens_ptr,
+    num_gen,
+    num_seq_slots,
+    num_layers,
+    local_layer,
+    partial_s0,
+    partial_s1,
+    partial_s2,
+    partial_s3,
+    pool_s0,
+    pool_s1,
+    lc_s0,
+    lc_s1,
+    page_size,
+    HEAD_D: tl.constexpr,
+    POOL_HEAD_D: tl.constexpr,
+    HP_POOL_SIZE: tl.constexpr,
+    TOKEN_BLOCK: tl.constexpr,
+    DIM_BLOCK: tl.constexpr,
+    NUM_DIM_BLOCKS: tl.constexpr,
+):
+    """Compute page-amax partials from the HP mirror plus current MTP tokens."""
+    seq_idx = tl.program_id(0)
+    page_rel = tl.program_id(1)
+    tile_dim = tl.program_id(2)
+    tile_idx = tile_dim // NUM_DIM_BLOCKS
+    dim_block = tile_dim - tile_idx * NUM_DIM_BLOCKS
+
+    valid_seq = (seq_idx < num_gen) & (local_layer >= 0) & (local_layer < num_layers)
+    kv_len = tl.load(kv_lens_ptr + seq_idx, mask=valid_seq, other=0).to(tl.int64)
+    gen_len = tl.load(gen_lens_ptr + seq_idx, mask=valid_seq, other=0).to(tl.int64)
+    first_new_pos = kv_len - gen_len
+    first_page = first_new_pos // page_size
+    page_start = (first_page + page_rel) * page_size
+    valid_page = (
+        valid_seq
+        & (gen_len > 0)
+        & (first_new_pos >= 0)
+        & (page_start < kv_len)
+        & (page_start + page_size > first_new_pos)
+    )
+    seq_slot = tl.load(seq_slots_ptr + seq_idx, mask=valid_page, other=-1).to(tl.int64)
+    valid_page &= (seq_slot >= 0) & (seq_slot < num_seq_slots)
+
+    token_offsets = tl.arange(0, TOKEN_BLOCK)
+    dim_offsets = dim_block * DIM_BLOCK + tl.arange(0, DIM_BLOCK)
+    abs_positions = page_start + tile_idx * TOKEN_BLOCK + token_offsets
+    valid_tokens = valid_page & (abs_positions >= 0) & (abs_positions < kv_len)
+    from_latent = abs_positions >= first_new_pos
+    hp_slots = abs_positions % HP_POOL_SIZE
+    latent_tokens = seq_idx * gen_len + abs_positions - first_new_pos
+    safe_latent_tokens = tl.where(valid_tokens & from_latent, latent_tokens, 0).to(tl.int64)
+    valid_dims = dim_offsets < HEAD_D
+    safe_dims = tl.where(valid_dims, dim_offsets, 0)
+
+    hp_values = tl.load(
+        hp_pool_ptr
+        + seq_slot * pool_s0
+        + local_layer * pool_s1
+        + hp_slots[:, None] * POOL_HEAD_D
+        + safe_dims[None, :],
+        mask=valid_tokens[:, None] & (~from_latent)[:, None] & valid_dims[None, :],
+        other=0.0,
+    ).to(tl.float32)
+    latent_values = tl.load(
+        latent_cache_ptr + safe_latent_tokens[:, None] * lc_s0 + safe_dims[None, :] * lc_s1,
+        mask=valid_tokens[:, None] & from_latent[:, None] & valid_dims[None, :],
+        other=0.0,
+    ).to(tl.float32)
+    tile_amax = tl.max(tl.max(tl.abs(hp_values + latent_values), axis=1), axis=0)
+    tl.store(
+        partial_amax_ptr
+        + seq_idx * partial_s0
+        + page_rel * partial_s1
+        + tile_idx * partial_s2
+        + dim_block * partial_s3,
+        tl.where(valid_page, tile_amax, 0.0),
+    )
+
+
+@triton.jit
+def _fp4_mla_generation_page_scale_kernel(
+    page_scale_ptr,
+    partial_amax_ptr,
+    kv_lens_ptr,
+    gen_lens_ptr,
+    page_ids_ptr,
+    paged_kv_indptr_ptr,
+    page_ids_len,
+    indptr_len,
+    num_pages,
+    partial_s0,
+    partial_s1,
+    partial_s2,
+    partial_s3,
+    page_scale_s0,
+    page_size,
+    GLOBAL_SCALE_MAX: tl.constexpr,
+    NUM_DIM_BLOCKS: tl.constexpr,
+    BLOCK_DIM_BLOCKS: tl.constexpr,
+    TILES_PER_PAGE: tl.constexpr,
+):
+    seq_idx = tl.program_id(0)
+    page_rel = tl.program_id(1)
+    valid_seq = seq_idx + 1 < indptr_len
+    kv_len = tl.load(kv_lens_ptr + seq_idx, mask=valid_seq, other=0).to(tl.int64)
+    gen_len = tl.load(gen_lens_ptr + seq_idx, mask=valid_seq, other=0).to(tl.int64)
+    first_new_pos = kv_len - gen_len
+    page_idx = first_new_pos // page_size + page_rel
+    page_start = page_idx * page_size
+    valid_page = (
+        valid_seq
+        & (gen_len > 0)
+        & (first_new_pos >= 0)
+        & (page_start < kv_len)
+        & (page_start + page_size > first_new_pos)
+    )
+
+    tiles = tl.arange(0, TILES_PER_PAGE)
+    dim_blocks = tl.arange(0, BLOCK_DIM_BLOCKS)
+    partials = tl.load(
+        partial_amax_ptr
+        + seq_idx * partial_s0
+        + page_rel * partial_s1
+        + tiles[:, None] * partial_s2
+        + dim_blocks[None, :] * partial_s3,
+        mask=valid_page & (dim_blocks[None, :] < NUM_DIM_BLOCKS),
+        other=0.0,
+    )
+    page_amax = tl.max(tl.max(partials, axis=1), axis=0)
+
+    page_table_start = tl.load(paged_kv_indptr_ptr + seq_idx, mask=valid_seq, other=0).to(tl.int64)
+    page_table_end = tl.load(paged_kv_indptr_ptr + seq_idx + 1, mask=valid_seq, other=0).to(
+        tl.int64
+    )
+    compact_page = page_table_start + page_idx
+    valid_compact_page = (
+        valid_page
+        & (compact_page >= page_table_start)
+        & (compact_page < page_table_end)
+        & (compact_page >= 0)
+        & (compact_page < page_ids_len)
+    )
+    physical_page = tl.load(page_ids_ptr + compact_page, mask=valid_compact_page, other=-1).to(
+        tl.int64
+    )
+    valid_page &= valid_compact_page & (physical_page >= 0) & (physical_page < num_pages)
+    page_scale = tl.where(page_amax > 0.0, GLOBAL_SCALE_MAX / tl.maximum(page_amax, 1.0e-12), 1.0)
+    tl.store(page_scale_ptr + physical_page * page_scale_s0, page_scale, mask=valid_page)
+
+
+@triton.jit
 def _fp4_mla_v_scale_store_context_tokens_kernel(
     kv_cache_ptr,
     sf_cache_ptr,
@@ -380,12 +675,14 @@ def _fp4_mla_v_scale_store_context_tokens_kernel(
     lc_s1,
     vsf_s0,
     vsf_s1,
+    global_scale_s0,
     HEAD_D: tl.constexpr,
     V_HEAD_D: tl.constexpr,
     HP_BLOCK: tl.constexpr,
     FP4_BLOCK: tl.constexpr,
     SF_PER_TOKEN: tl.constexpr,
     SF_PER_PAGE: tl.constexpr,
+    KV_GLOBAL_SCALE_PER_PAGE: tl.constexpr,
 ):
     token_idx = tl.program_id(0)
     dim_block = tl.program_id(1)
@@ -468,7 +765,10 @@ def _fp4_mla_v_scale_store_context_tokens_kernel(
         tl.max(tl.abs(odd_values), axis=1),
     )
     tile_amax = tl.max(amax_per_token, axis=0)
-    kv_global_scale = tl.load(global_scale_ptr)
+    if KV_GLOBAL_SCALE_PER_PAGE:
+        kv_global_scale = tl.load(global_scale_ptr + physical_page * global_scale_s0)
+    else:
+        kv_global_scale = tl.load(global_scale_ptr)
     # K consumes scales as [token, dim-block], while V consumes scales as
     # [dim, token-block].  Only the compressed-KV prefix has both views, so
     # tail K-only dims keep K's per-token scale.
@@ -684,12 +984,16 @@ def _fp4_mla_v_scale_store_generation_tiles_kernel(
     lc_s1,
     vsf_s0,
     vsf_s1,
+    global_scale_s0,
     HEAD_D: tl.constexpr,
     V_HEAD_D: tl.constexpr,
     HP_BLOCK: tl.constexpr,
+    HP_POOL_SIZE: tl.constexpr,
     FP4_BLOCK: tl.constexpr,
     SF_PER_TOKEN: tl.constexpr,
     SF_PER_PAGE: tl.constexpr,
+    REWRITE_PAGE: tl.constexpr,
+    KV_GLOBAL_SCALE_PER_PAGE: tl.constexpr,
 ):
     seq_idx = tl.program_id(0)
     tile_idx = tl.program_id(1)
@@ -704,12 +1008,16 @@ def _fp4_mla_v_scale_store_generation_tiles_kernel(
     if gen_len <= 0:
         return
     first_new_pos = kv_len - gen_len
-    first_tile_pos = (first_new_pos // HP_BLOCK) * HP_BLOCK
+    if REWRITE_PAGE:
+        first_tile_pos = (first_new_pos // page_size) * page_size
+    else:
+        first_tile_pos = (first_new_pos // HP_BLOCK) * HP_BLOCK
     block_base_pos = first_tile_pos + tile_idx * HP_BLOCK
     if block_base_pos >= kv_len:
         return
-    if block_base_pos + HP_BLOCK <= first_new_pos:
-        return
+    if not REWRITE_PAGE:
+        if block_base_pos + HP_BLOCK <= first_new_pos:
+            return
 
     page_idx = block_base_pos // page_size
     page_pos = block_base_pos - page_idx * page_size
@@ -747,7 +1055,7 @@ def _fp4_mla_v_scale_store_generation_tiles_kernel(
     abs_positions = block_base_pos + token_offsets
     valid_tokens = abs_positions < kv_len
     from_latent = abs_positions >= first_new_pos
-    hp_slots = abs_positions % HP_BLOCK
+    hp_slots = abs_positions % HP_POOL_SIZE
     new_token_offsets = abs_positions - first_new_pos
     # Linear MTP uses a uniform generation length, so each sequence occupies a
     # contiguous gen_len slice in latent_cache.
@@ -790,13 +1098,20 @@ def _fp4_mla_v_scale_store_generation_tiles_kernel(
         tl.max(tl.abs(odd_values), axis=1),
     )
     tile_amax = tl.max(amax_per_token, axis=0)
-    global_scale = tl.load(global_scale_ptr)
+    if KV_GLOBAL_SCALE_PER_PAGE:
+        global_scale = tl.load(global_scale_ptr + physical_page * global_scale_s0)
+    else:
+        global_scale = tl.load(global_scale_ptr)
     shared_tile = dim_block * FP4_BLOCK < V_HEAD_D
     tile_scale = tl.where(tile_amax > 0.0, tile_amax / 6.0, 1.0)
     token_scale = tl.where(amax_per_token > 0.0, amax_per_token / 6.0, 1.0)
     local_scale = tl.where(shared_tile, tile_scale, token_scale)
-    stored_scale = local_scale * global_scale
-    v_stored_scale = tile_scale * global_scale
+    if KV_GLOBAL_SCALE_PER_PAGE:
+        stored_scale = tl.minimum(local_scale * global_scale, 448.0)
+        v_stored_scale = tl.minimum(tile_scale * global_scale, 448.0)
+    else:
+        stored_scale = local_scale * global_scale
+        v_stored_scale = tile_scale * global_scale
 
     low = _fp4_e2m1_quantize(even_values / local_scale[:, None])
     high = _fp4_e2m1_quantize(odd_values / local_scale[:, None])

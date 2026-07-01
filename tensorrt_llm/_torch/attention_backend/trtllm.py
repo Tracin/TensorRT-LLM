@@ -37,7 +37,8 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from ..utils import (compute_swizzled_sf_shape, get_global_attrs,
                      get_model_extra_attrs)
-from .fp4_mla import FP4_MLA_KV_GLOBAL_SCALE, HP_BLOCK_SIZE, apply_fp4_mla_rope
+from .fp4_mla import (FP4_MLA_KV_GLOBAL_SCALE, HP_BLOCK_SIZE,
+                      apply_fp4_mla_rope, get_fp4_mla_hp_block_size)
 from .interface import (AttentionBackend, AttentionForwardArgs,
                         AttentionInputType, AttentionMask, AttentionMetadata,
                         KVCacheParams, MLAParams, PositionalEmbeddingParams,
@@ -159,8 +160,9 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     is_warmup: bool = False
 
     # High-precision BF16 KV pool for MLA FP4 models, indexed by seq_slot.
-    # Shape: [max_num_sequences, num_local_layers, kv_factor, HP_BLOCK_SIZE * head_dim]
+    # Shape: [max_num_sequences, num_local_layers, kv_factor, hp_block_size * head_dim]
     # Standalone tensor, not part of the block-based paged KV cache.
+    fp4_mla_hp_block_size: int = field(init=False, default=HP_BLOCK_SIZE)
     high_precision_kv_pool: Optional[torch.Tensor] = None
     fp4_mla_hp_snapshot_pool: Optional[torch.Tensor] = None
     fp4_mla_v_scale_pool: Optional[torch.Tensor] = None
@@ -283,6 +285,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
 
     def __post_init__(self) -> None:
         super().__post_init__()
+        self.fp4_mla_hp_block_size = get_fp4_mla_hp_block_size()
         self.enable_helix = self.mapping.has_cp_helix(
         ) if self.mapping is not None else False
         self.use_paged_context_fmha = (
@@ -466,7 +469,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
 
         # Allocate high-precision BF16 KV pool for MLA FP4 models.
         # Standalone tensor indexed by seq_slot, not part of block-based paged KV cache.
-        # Each sequence gets a circular buffer of HP_BLOCK_SIZE=16 recent tokens at BF16.
+        # Dynamic page scaling retains a full page; static scaling retains one tile.
         if (self.kv_cache_manager is not None
                 and self.kv_cache_manager.kv_factor == 1
                 and self.kv_cache_manager.dtype == DataType.NVFP4):
@@ -487,11 +490,12 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             num_local_layers = self.kv_cache_manager.num_local_layers
             head_dim = self.kv_cache_manager.head_dim
             kv_factor = self.kv_cache_manager.kv_factor
+            hp_block_size = self.fp4_mla_hp_block_size
             self.high_precision_kv_pool = self.get_empty(
                 buffers,
                 [
                     self.max_num_sequences, num_local_layers, kv_factor,
-                    HP_BLOCK_SIZE * head_dim
+                    hp_block_size * head_dim
                 ],
                 cache_name="high_precision_kv_pool",
                 dtype=torch.bfloat16,
@@ -502,7 +506,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                     buffers,
                     [
                         self.max_num_sequences, num_local_layers, kv_factor,
-                        HP_BLOCK_SIZE * head_dim
+                        hp_block_size * head_dim
                     ],
                     cache_name="fp4_mla_hp_snapshot_pool",
                     dtype=torch.bfloat16,
@@ -592,6 +596,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         # Especially for the changes in the _preprocess_inputs() of model_engine.py.
         if self.enable_flash_mla:
             self._flash_mla_metadata_valid = False
+        self._update_fp4_mla_append_metadata()
 
     def _update_fp4_mla_append_metadata(self) -> None:
         if self.high_precision_kv_pool is not None and self.num_tokens > 0:

@@ -14,15 +14,21 @@ from tensorrt_llm._torch.attention_backend.fmha.fp4_mla import Fp4MlaFmha
 from tensorrt_llm._torch.attention_backend.fp4_mla import (
     FP4_BLOCK_SIZE,
     FP4_MLA_ATTENTION_BACKEND_ENV,
+    FP4_MLA_DYNAMIC_GLOBAL_SCALE_ENV,
     FP4_MLA_KV_GLOBAL_SCALE,
     FP4_MLA_P_GLOBAL_SCALE,
     FP4_MLA_Q_RESIDUAL_DIM,
     FP4_MLA_TOKENS_PER_BLOCK,
     HP_BLOCK_SIZE,
     _cutile_backend_available,
+    _dynamic_fp4_mla_q_scale,
     _get_cutile_v_packed_cache,
     _maybe_update_cutile_v_packed_cache,
     _snapshot_hp_kv_for_mtp_generation,
+    _validate_fp4_mla_dynamic_scale_backend,
+    fp4_mla_dynamic_global_scale_enabled,
+    get_fp4_mla_hp_block_size,
+    get_fp4_mla_kv_global_scale_pool_view,
     get_fp4_mla_v_scale_pool_shape,
     get_fp4_mla_v_scale_pool_size,
     get_fp4_mla_v_scale_pool_view,
@@ -68,6 +74,43 @@ def test_fp4_mla_fmha_available_for_context_and_generation_head_dims(monkeypatch
     assert Fp4MlaFmha.is_available(_fp4_mla_attn_for_availability(128 + 64))
     assert Fp4MlaFmha.is_available(_fp4_mla_attn_for_availability(512 + 64))
     assert not Fp4MlaFmha.is_available(_fp4_mla_attn_for_availability(128))
+
+    mtp_attn = _fp4_mla_attn_for_availability(512 + 64)
+    mtp_attn.predicted_tokens_per_seq = HP_BLOCK_SIZE + 1
+    assert not Fp4MlaFmha.is_available(mtp_attn)
+    monkeypatch.setenv(FP4_MLA_DYNAMIC_GLOBAL_SCALE_ENV, "1")
+    monkeypatch.setenv(FP4_MLA_ATTENTION_BACKEND_ENV, "triton")
+    assert Fp4MlaFmha.is_available(mtp_attn)
+
+
+def test_fp4_mla_dynamic_global_scale_env_is_triton_only(monkeypatch):
+    monkeypatch.delenv(FP4_MLA_DYNAMIC_GLOBAL_SCALE_ENV, raising=False)
+    monkeypatch.delenv(FP4_MLA_ATTENTION_BACKEND_ENV, raising=False)
+    assert not fp4_mla_dynamic_global_scale_enabled()
+    assert get_fp4_mla_hp_block_size() == HP_BLOCK_SIZE
+
+    monkeypatch.setenv(FP4_MLA_DYNAMIC_GLOBAL_SCALE_ENV, "1")
+    monkeypatch.setenv(FP4_MLA_ATTENTION_BACKEND_ENV, "triton")
+    assert fp4_mla_dynamic_global_scale_enabled()
+    assert get_fp4_mla_hp_block_size() == FP4_MLA_TOKENS_PER_BLOCK
+    _validate_fp4_mla_dynamic_scale_backend()
+
+    monkeypatch.setenv(FP4_MLA_ATTENTION_BACKEND_ENV, "cutile")
+    assert get_fp4_mla_hp_block_size() == HP_BLOCK_SIZE
+    with pytest.raises(ValueError, match="supported only"):
+        _validate_fp4_mla_dynamic_scale_backend()
+
+
+def test_fp4_mla_dynamic_q_scale_is_per_tensor():
+    q = torch.tensor([[-2.0, 0.5], [1.0, -0.25]], dtype=torch.bfloat16)
+    torch.testing.assert_close(
+        _dynamic_fp4_mla_q_scale(q),
+        torch.tensor([FP4_MLA_P_GLOBAL_SCALE / 2.0]),
+    )
+    torch.testing.assert_close(
+        _dynamic_fp4_mla_q_scale(torch.zeros_like(q)),
+        torch.ones(1),
+    )
 
 
 def _swizzled_sf_offset(row_idx: int, col_idx: int, sf_per_token: int) -> int:
@@ -171,11 +214,11 @@ def _build_metadata(kv_cache_manager, *, num_tokens, page_size, num_layers):
     batch_indices = torch.zeros(num_tokens, dtype=torch.int32, device=device)
     positions = torch.arange(num_tokens, dtype=torch.int32, device=device)
 
-    # HP pool: one sequence slot, HP_BLOCK_SIZE * head_dim BF16 values per
-    # (seq_slot, layer) cell.
+    # HP pool: one sequence slot and the active static/dynamic tail window.
     head_dim = kv_cache_manager.head_dim
+    hp_block_size = get_fp4_mla_hp_block_size()
     hp_pool = torch.zeros(
-        (1, num_layers, 1, HP_BLOCK_SIZE * head_dim),
+        (1, num_layers, 1, hp_block_size * head_dim),
         dtype=torch.bfloat16,
         device=device,
     )
@@ -198,6 +241,7 @@ def _build_metadata(kv_cache_manager, *, num_tokens, page_size, num_layers):
         num_generation_blocks=num_blocks,
         num_contexts=1,
         num_seqs=1,
+        fp4_mla_hp_block_size=hp_block_size,
         high_precision_kv_pool=hp_pool,
         fp4_mla_v_scale_pool=kv_cache_manager.get_mla_v_scale_pool(),
         hp_pool_owners={},
@@ -244,8 +288,9 @@ def _build_multi_seq_metadata(kv_cache_manager, *, seq_lens, page_size, num_laye
     )
 
     head_dim = kv_cache_manager.head_dim
+    hp_block_size = get_fp4_mla_hp_block_size()
     hp_pool = torch.zeros(
-        (num_seqs, num_layers, 1, HP_BLOCK_SIZE * head_dim),
+        (num_seqs, num_layers, 1, hp_block_size * head_dim),
         dtype=torch.bfloat16,
         device=device,
     )
@@ -269,6 +314,7 @@ def _build_multi_seq_metadata(kv_cache_manager, *, seq_lens, page_size, num_laye
         num_contexts=num_seqs,
         num_seqs=num_seqs,
         num_blocks=num_blocks,
+        fp4_mla_hp_block_size=hp_block_size,
         high_precision_kv_pool=hp_pool,
         fp4_mla_v_scale_pool=kv_cache_manager.get_mla_v_scale_pool(),
         hp_pool_owners={},
@@ -292,6 +338,11 @@ def _materialize_reference_cache(metadata, layer_idx: int, head_dim: int) -> tor
     src_page_ids = metadata.paged_kv_indices[
         metadata.num_context_blocks : metadata.num_context_blocks + metadata.num_generation_blocks
     ]
+    page_global_scales = None
+    if fp4_mla_dynamic_global_scale_enabled():
+        page_global_scales = get_fp4_mla_kv_global_scale_pool_view(
+            metadata, v_head_dim=head_dim - FP4_MLA_Q_RESIDUAL_DIM
+        )[layer_idx]
     for page_id in src_page_ids.tolist():
         fp4_page = kv_cache[page_id, 0, :, 0, :]
         sf_page = sf_cache[page_id]
@@ -301,7 +352,11 @@ def _materialize_reference_cache(metadata, layer_idx: int, head_dim: int) -> tor
                 sf_page,
                 logical_dim=head_dim,
                 sf_per_token=head_dim // FP4_BLOCK_SIZE,
-                global_scale=_TEST_GLOBAL_SCALE,
+                global_scale=(
+                    float(page_global_scales[page_id].item())
+                    if page_global_scales is not None
+                    else _TEST_GLOBAL_SCALE
+                ),
             )
         )
     if not pages:
@@ -401,8 +456,11 @@ def _fp4_mla_attention_decode_reference(
     head_dim = kv_lora_rank + qk_rope_head_dim
     dequant_cache = _materialize_reference_cache(metadata, 0, head_dim)
     num_heads = q_nope.shape[1]
-    global_scale = metadata._fp4_mla_global_scale
     q_full = torch.cat((q_nope, q_pe), dim=-1).reshape(-1, head_dim)
+    if fp4_mla_dynamic_global_scale_enabled():
+        global_scale = _dynamic_fp4_mla_q_scale(q_full)
+    else:
+        global_scale = metadata._fp4_mla_global_scale
     q_fp4, q_sf = torch.ops.trtllm.fp4_quantize_with_residual(
         q_full,
         global_scale,
@@ -415,7 +473,7 @@ def _fp4_mla_attention_decode_reference(
         q_sf.view(torch.float8_e4m3fn),
         logical_dim=q_logical_dim,
         sf_per_token=q_logical_dim // FP4_BLOCK_SIZE,
-        global_scale=_TEST_GLOBAL_SCALE,
+        global_scale=float(global_scale.item()),
     )
 
     p_dequant = None
@@ -543,6 +601,25 @@ def _assert_fp4_mla_attention_decode_accuracy(
         torch.cuda.empty_cache()
 
 
+def test_fp4_mla_kv_global_scale_uses_v_scale_pool_tail():
+    num_layers = 2
+    num_pages = 3
+    v_head_dim = 512
+    latent_head_dim = v_head_dim + FP4_MLA_Q_RESIDUAL_DIM
+    page_size = FP4_MLA_TOKENS_PER_BLOCK
+    allocated_page_bytes = get_fp4_mla_v_scale_pool_size(latent_head_dim, page_size)
+    v_scale_bytes = get_fp4_mla_v_scale_pool_size(v_head_dim, page_size)
+    pool = torch.zeros((num_layers, num_pages, allocated_page_bytes), dtype=torch.uint8)
+    metadata = SimpleNamespace(page_size=page_size, fp4_mla_v_scale_pool=pool)
+
+    page_scales = get_fp4_mla_kv_global_scale_pool_view(metadata, v_head_dim=v_head_dim)
+    assert tuple(page_scales.shape) == (num_layers, num_pages)
+    assert page_scales.stride(1) == allocated_page_bytes // torch.float32.itemsize
+    page_scales[1, 2] = 7.25
+    assert pool[1, 2, :v_scale_bytes].count_nonzero().item() == 0
+    assert pool[1, 2, v_scale_bytes : v_scale_bytes + 4].view(torch.float32).item() == 7.25
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_fp4_mla_v_scale_pool_view_shape():
     device = torch.device("cuda")
@@ -576,14 +653,15 @@ def _materialize_single_seq_cache_with_hp_tail(
         .reshape(-1, head_dim)[:num_tokens]
         .to(torch.bfloat16)
     )
-    tail = num_tokens % HP_BLOCK_SIZE
+    hp_block_size = getattr(metadata, "fp4_mla_hp_block_size", HP_BLOCK_SIZE)
+    tail = num_tokens % hp_block_size
     if tail == 0:
         return flat
 
     seq_slot = int(metadata.seq_slots[0].item())
-    pool_head_dim = metadata.high_precision_kv_pool.shape[-1] // HP_BLOCK_SIZE
+    pool_head_dim = metadata.high_precision_kv_pool.shape[-1] // hp_block_size
     hp_view = metadata.high_precision_kv_pool[seq_slot, local_layer, 0, :].view(
-        HP_BLOCK_SIZE, pool_head_dim
+        hp_block_size, pool_head_dim
     )
     flat[-tail:] = hp_view[:tail, :head_dim]
     return flat
@@ -752,21 +830,123 @@ def test_fp4_mla_hp_overlay_generation_phase():
         kv_cache_manager.shutdown()
 
 
+@pytest.mark.skipif(_is_pre_blackwell(), reason="requires Blackwell FP4 support")
+def test_fp4_mla_dynamic_scale_mtp_requantizes_touched_pages(monkeypatch):
+    monkeypatch.setenv(FP4_MLA_ATTENTION_BACKEND_ENV, "triton")
+    monkeypatch.setenv(FP4_MLA_DYNAMIC_GLOBAL_SCALE_ENV, "1")
+    torch.manual_seed(31)
+    device = torch.device("cuda")
+    kv_lora_rank = 512
+    head_dim = kv_lora_rank + FP4_MLA_Q_RESIDUAL_DIM
+    page_size = FP4_MLA_TOKENS_PER_BLOCK
+    ctx_tokens = page_size - 1
+    gen_tokens = 4
+    total_tokens = ctx_tokens + gen_tokens
+
+    mapping = Mapping(world_size=1, tp_size=1, rank=0)
+    kv_cache_manager = KVCacheManager(
+        KvCacheConfig(max_tokens=page_size * 2, enable_block_reuse=False),
+        _CacheType.SELFKONLY,
+        num_layers=1,
+        num_kv_heads=1,
+        head_dim=head_dim,
+        tokens_per_block=page_size,
+        max_seq_len=page_size * 2,
+        max_batch_size=1,
+        mapping=mapping,
+        dtype=_DataType.NVFP4,
+    )
+    try:
+        kv_cache_manager.add_dummy_requests([0], [total_tokens])
+        kv_cache_manager.get_buffers(0).view(torch.uint8).zero_()
+        kv_cache_manager.get_block_scale_buffers(0).zero_()
+        metadata = _build_metadata(
+            kv_cache_manager,
+            num_tokens=total_tokens,
+            page_size=page_size,
+            num_layers=1,
+        )
+        ctx_latent = (
+            torch.randn(ctx_tokens, head_dim, dtype=torch.bfloat16, device=device) * 0.1
+        ).clamp_(-0.5, 0.5)
+        gen_latent = (
+            torch.randn(gen_tokens, head_dim, dtype=torch.bfloat16, device=device) * 0.5
+        ).clamp_(-2.0, 2.0)
+
+        metadata.kv_lens_cuda_runtime = torch.tensor([ctx_tokens], dtype=torch.int32, device=device)
+        metadata.prompt_lens_cuda_runtime = metadata.kv_lens_cuda_runtime
+        metadata.prompt_lens_cpu_runtime = torch.tensor([ctx_tokens], dtype=torch.int32)
+        metadata.positions = torch.arange(ctx_tokens, dtype=torch.int32, device=device)
+        metadata.batch_indices = torch.zeros(ctx_tokens, dtype=torch.int32, device=device)
+        scatter_fp4_mla_kv_cache(
+            metadata,
+            ctx_latent,
+            layer_idx=0,
+            token_offset=0,
+            phase="context",
+            local_layer=0,
+            v_head_dim=kv_lora_rank,
+        )
+        update_hp_kv_for_fp4_mla(metadata, ctx_latent, local_layer=0, phase="context")
+
+        metadata.num_contexts = 0
+        metadata.kv_lens_cuda_runtime = torch.tensor(
+            [total_tokens], dtype=torch.int32, device=device
+        )
+        metadata.prompt_lens_cuda_runtime = torch.tensor(
+            [gen_tokens], dtype=torch.int32, device=device
+        )
+        metadata.prompt_lens_cpu_runtime = torch.tensor([gen_tokens], dtype=torch.int32)
+        metadata.positions = torch.arange(
+            ctx_tokens, total_tokens, dtype=torch.int32, device=device
+        )
+        metadata.batch_indices = torch.zeros(gen_tokens, dtype=torch.int32, device=device)
+        scatter_fp4_mla_kv_cache(
+            metadata,
+            gen_latent,
+            layer_idx=0,
+            token_offset=0,
+            phase="generation",
+            local_layer=0,
+            v_head_dim=kv_lora_rank,
+        )
+        torch.cuda.synchronize()
+
+        all_latent = torch.cat((ctx_latent, gen_latent), dim=0)
+        physical_pages = metadata.paged_kv_indices.tolist()
+        page_scales = get_fp4_mla_kv_global_scale_pool_view(metadata, v_head_dim=kv_lora_rank)[0]
+        for logical_page, physical_page in enumerate(physical_pages):
+            page_values = all_latent[logical_page * page_size : (logical_page + 1) * page_size]
+            expected_scale = FP4_MLA_P_GLOBAL_SCALE / page_values.float().abs().max()
+            torch.testing.assert_close(
+                page_scales[physical_page], expected_scale, atol=1e-4, rtol=1e-4
+            )
+
+        recovered = _materialize_reference_cache(metadata, 0, head_dim).reshape(-1, head_dim)
+        torch.testing.assert_close(recovered[:total_tokens], all_latent.float(), atol=1.0, rtol=0.5)
+    finally:
+        kv_cache_manager.shutdown()
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("preallocated_snapshot", [False, True])
-def test_fp4_mla_hp_pool_restores_rejected_linear_mtp_tokens(preallocated_snapshot: bool):
+@pytest.mark.parametrize("hp_block_size", [HP_BLOCK_SIZE, FP4_MLA_TOKENS_PER_BLOCK])
+def test_fp4_mla_hp_pool_restores_rejected_linear_mtp_tokens(
+    preallocated_snapshot: bool, hp_block_size: int
+):
     device = torch.device("cuda")
     head_dim = 8
     old_len = 30
     gen_len = 4
     accepted_len = 2
     initial_hp = (
-        torch.arange(HP_BLOCK_SIZE * head_dim, dtype=torch.float32, device=device)
-        .reshape(HP_BLOCK_SIZE, head_dim)
+        torch.arange(hp_block_size * head_dim, dtype=torch.float32, device=device)
+        .reshape(hp_block_size, head_dim)
         .to(torch.bfloat16)
     )
-    hp_pool = initial_hp.reshape(1, 1, 1, HP_BLOCK_SIZE * head_dim).clone()
+    hp_pool = initial_hp.reshape(1, 1, 1, hp_block_size * head_dim).clone()
     metadata = SimpleNamespace(
+        fp4_mla_hp_block_size=hp_block_size,
         high_precision_kv_pool=hp_pool,
         fp4_mla_hp_snapshot_pool=None,
         seq_slots=torch.tensor([0], dtype=torch.int32, device=device),
@@ -795,9 +975,9 @@ def test_fp4_mla_hp_pool_restores_rejected_linear_mtp_tokens(preallocated_snapsh
         torch.tensor([accepted_len], dtype=torch.int32, device=device),
     )
 
-    hp_view = hp_pool.view(HP_BLOCK_SIZE, head_dim)
-    accepted_slots = [(old_len + idx) % HP_BLOCK_SIZE for idx in range(accepted_len)]
-    rejected_slots = [(old_len + idx) % HP_BLOCK_SIZE for idx in range(accepted_len, gen_len)]
+    hp_view = hp_pool.view(hp_block_size, head_dim)
+    accepted_slots = [(old_len + idx) % hp_block_size for idx in range(accepted_len)]
+    rejected_slots = [(old_len + idx) % hp_block_size for idx in range(accepted_len, gen_len)]
     for idx, slot in enumerate(accepted_slots):
         torch.testing.assert_close(hp_view[slot].float(), gen_latent[idx].float())
     for idx, slot in enumerate(rejected_slots, start=accepted_len):
@@ -822,14 +1002,24 @@ def test_fp4_mla_kv_lens_update_rebuilds_append_positions():
         batch_indices=torch.empty(4, dtype=torch.int32),
         positions=torch.empty(4, dtype=torch.int32),
         seq_lens_kv_cuda=torch.tensor([4], dtype=torch.int32),
-        kv_lens_cuda_runtime=torch.tensor([12], dtype=torch.int32),
+        kv_lens_cuda_runtime=torch.tensor([15], dtype=torch.int32),
         prompt_lens_cuda_runtime=torch.tensor([4], dtype=torch.int32),
     )
     metadata._populate_fp4_mla_batch_indices_positions = lambda: (
         TrtllmAttentionMetadata._populate_fp4_mla_batch_indices_positions(metadata)
     )
+    metadata._update_fp4_mla_append_metadata = lambda: (
+        TrtllmAttentionMetadata._update_fp4_mla_append_metadata(metadata)
+    )
 
     TrtllmAttentionMetadata._update_fp4_mla_append_metadata(metadata)
+    torch.testing.assert_close(
+        metadata.positions,
+        torch.tensor([11, 12, 13, 14], dtype=torch.int32),
+    )
+
+    metadata.kv_lens_cuda_runtime.sub_(3)
+    TrtllmAttentionMetadata.on_update_kv_lens(metadata)
 
     torch.testing.assert_close(
         metadata.positions,
@@ -1241,6 +1431,20 @@ def test_fp4_mla_attention_decode_linear_mtp_matches_reference(monkeypatch):
         seed=11,
         check_probs=True,
         query_len_per_seq=3,
+    )
+
+
+@pytest.mark.skipif(_is_pre_blackwell(), reason="requires Blackwell FP4 tensor cores")
+def test_fp4_mla_dynamic_scale_linear_mtp_decode_matches_reference(monkeypatch):
+    monkeypatch.setenv(FP4_MLA_DYNAMIC_GLOBAL_SCALE_ENV, "1")
+    _assert_fp4_mla_attention_decode_accuracy(
+        monkeypatch,
+        backend="triton",
+        num_heads=5,
+        seq_lens=[129, 256],
+        seed=37,
+        check_probs=True,
+        query_len_per_seq=4,
     )
 
 
