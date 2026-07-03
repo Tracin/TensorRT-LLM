@@ -107,6 +107,70 @@ def _ceil_div(lhs: int, rhs: int) -> int:
     return (lhs + rhs - 1) // rhs
 
 
+@triton.jit
+def _fp4_mla_generation_lengths_kernel(
+    kv_lens_ptr,
+    prompt_lens_ptr,
+    corrected_kv_lens_ptr,
+    generation_lens_ptr,
+    num_gen,
+    generation_len,
+    BLOCK: tl.constexpr,
+):
+    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = offsets < num_gen
+    kv_lens = tl.load(kv_lens_ptr + offsets, mask=mask, other=0)
+    prompt_lens = tl.load(prompt_lens_ptr + offsets, mask=mask, other=0)
+    tl.store(
+        corrected_kv_lens_ptr + offsets,
+        kv_lens - prompt_lens + generation_len,
+        mask=mask,
+    )
+    tl.store(generation_lens_ptr + offsets, generation_len, mask=mask)
+
+
+def populate_fp4_mla_generation_lengths(
+    kv_lens: torch.Tensor,
+    prompt_lens: torch.Tensor,
+    corrected_kv_lens: torch.Tensor,
+    generation_lens: torch.Tensor,
+    *,
+    num_gen_tokens: int,
+    num_gen: int,
+) -> None:
+    """Populate reusable FP4 MLA generation lengths in one Triton launch."""
+    if num_gen <= 0 or num_gen_tokens % num_gen != 0:
+        raise ValueError(
+            "FP4 MLA generation lengths require a positive sequence count and "
+            f"uniform token count, got {num_gen_tokens} tokens for {num_gen} sequences."
+        )
+    tensors = (kv_lens, prompt_lens, corrected_kv_lens, generation_lens)
+    if any(tensor.ndim != 1 or tensor.stride(0) != 1 for tensor in tensors):
+        raise ValueError(
+            "FP4 MLA generation length tensors must be contiguous and one-dimensional."
+        )
+    if any(tensor.dtype != torch.int32 for tensor in tensors):
+        raise TypeError("FP4 MLA generation length tensors must use int32.")
+    if any(not tensor.is_cuda for tensor in tensors):
+        raise ValueError("FP4 MLA generation length tensors must be CUDA tensors.")
+    if any(tensor.device != kv_lens.device for tensor in tensors[1:]):
+        raise ValueError("FP4 MLA generation length tensors must be on the same device.")
+    if any(tensor.numel() < num_gen for tensor in tensors):
+        raise ValueError(f"FP4 MLA generation length tensors need at least {num_gen} entries.")
+
+    block = 128
+    _fp4_mla_generation_lengths_kernel[(triton.cdiv(num_gen, block),)](
+        kv_lens,
+        prompt_lens,
+        corrected_kv_lens,
+        generation_lens,
+        num_gen,
+        num_gen_tokens // num_gen,
+        BLOCK=block,
+        num_warps=4,
+    )
+
+
 _SM_COUNT_CACHE: dict[int, int] = {}
 
 
@@ -118,6 +182,74 @@ def _get_sm_count(device: torch.device) -> int:
         count = torch.cuda.get_device_properties(index).multi_processor_count
         _SM_COUNT_CACHE[index] = count
     return count
+
+
+@triton.jit
+def _fp4_mla_rope_qk_kernel(
+    q_ptr,
+    k_ptr,
+    q_out_ptr,
+    positions_ptr,
+    rotary_cos_sin_ptr,
+    num_heads,
+    q_s0,
+    q_s1,
+    q_s2,
+    k_s0,
+    k_s1,
+    q_out_s0,
+    q_out_s1,
+    q_out_s2,
+    positions_s0,
+    ROPE_DIM: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    BLOCK_PAIRS: tl.constexpr,
+):
+    token_idx = tl.program_id(0).to(tl.int64)
+    head_block = tl.program_id(1)
+    head_offsets = head_block * BLOCK_H + tl.arange(0, BLOCK_H)
+    pair_offsets = tl.arange(0, BLOCK_PAIRS)
+    pair_mask = pair_offsets < ROPE_DIM // 2
+    q_mask = (head_offsets[:, None] < num_heads) & pair_mask[None, :]
+
+    position = tl.load(positions_ptr + token_idx * positions_s0).to(tl.int64)
+    rotary_base = position * (ROPE_DIM * 2) + pair_offsets * 2
+    cos = tl.load(rotary_cos_sin_ptr + rotary_base, mask=pair_mask, other=0.0)
+    sin = tl.load(rotary_cos_sin_ptr + rotary_base + 1, mask=pair_mask, other=0.0)
+    cos = cos.to(tl.bfloat16).to(tl.float32)
+    sin = sin.to(tl.bfloat16).to(tl.float32)
+
+    q_base = token_idx * q_s0 + head_offsets[:, None].to(tl.int64) * q_s1
+    q_even_offsets = q_base + (pair_offsets[None, :] * 2).to(tl.int64) * q_s2
+    q_odd_offsets = q_even_offsets + q_s2
+    q_even = tl.load(q_ptr + q_even_offsets, mask=q_mask, other=0.0).to(tl.float32)
+    q_odd = tl.load(q_ptr + q_odd_offsets, mask=q_mask, other=0.0).to(tl.float32)
+    q_even_cos = (q_even * cos[None, :]).to(tl.bfloat16).to(tl.float32)
+    q_odd_sin = (q_odd * sin[None, :]).to(tl.bfloat16).to(tl.float32)
+    q_odd_cos = (q_odd * cos[None, :]).to(tl.bfloat16).to(tl.float32)
+    q_even_sin = (q_even * sin[None, :]).to(tl.bfloat16).to(tl.float32)
+    q_roped_even = (q_even_cos - q_odd_sin).to(tl.bfloat16)
+    q_roped_odd = (q_odd_cos + q_even_sin).to(tl.bfloat16)
+
+    q_out_base = token_idx * q_out_s0 + head_offsets[:, None].to(tl.int64) * q_out_s1
+    q_out_even_offsets = q_out_base + (pair_offsets[None, :] * 2).to(tl.int64) * q_out_s2
+    tl.store(q_out_ptr + q_out_even_offsets, q_roped_even, mask=q_mask)
+    tl.store(q_out_ptr + q_out_even_offsets + q_out_s2, q_roped_odd, mask=q_mask)
+
+    if head_block == 0:
+        k_base = token_idx * k_s0
+        k_even_offsets = k_base + (pair_offsets * 2).to(tl.int64) * k_s1
+        k_odd_offsets = k_even_offsets + k_s1
+        k_even = tl.load(k_ptr + k_even_offsets, mask=pair_mask, other=0.0).to(tl.float32)
+        k_odd = tl.load(k_ptr + k_odd_offsets, mask=pair_mask, other=0.0).to(tl.float32)
+        k_even_cos = (k_even * cos).to(tl.bfloat16).to(tl.float32)
+        k_odd_sin = (k_odd * sin).to(tl.bfloat16).to(tl.float32)
+        k_odd_cos = (k_odd * cos).to(tl.bfloat16).to(tl.float32)
+        k_even_sin = (k_even * sin).to(tl.bfloat16).to(tl.float32)
+        k_roped_even = (k_even_cos - k_odd_sin).to(tl.bfloat16)
+        k_roped_odd = (k_odd_cos + k_even_sin).to(tl.bfloat16)
+        tl.store(k_ptr + k_even_offsets, k_roped_even, mask=pair_mask)
+        tl.store(k_ptr + k_odd_offsets, k_roped_odd, mask=pair_mask)
 
 
 def apply_fp4_mla_rope(
@@ -135,7 +267,7 @@ def apply_fp4_mla_rope(
             f"MLA RoPE target last dimension must be {rope_dim}, got {target.shape[-1]}."
         )
 
-    positions = positions[: target.shape[0]].to(torch.long)
+    positions = positions[: target.shape[0]]
     cos_sin = rotary_cos_sin.view(max_positions, rope_dim, 2).index_select(0, positions)
     pair_count = rope_dim // 2
 
@@ -155,6 +287,81 @@ def apply_fp4_mla_rope(
     target_roped[..., 0::2] = target_even * cos - target_odd * sin
     target_roped[..., 1::2] = target_odd * cos + target_even * sin
     return target_roped.to(target.dtype)
+
+
+def apply_fp4_mla_rope_qk(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    q_out: torch.Tensor,
+    positions: torch.Tensor,
+    rotary_cos_sin: torch.Tensor,
+    max_positions: int,
+    rope_dim: int,
+) -> None:
+    """Apply FP4 MLA generation RoPE to Q and K in one Triton launch."""
+    if q.ndim != 3 or q.shape[-1] != rope_dim:
+        raise ValueError(f"q must have shape [tokens, heads, {rope_dim}], got {tuple(q.shape)}.")
+    if k.ndim != 2 or k.shape != (q.shape[0], rope_dim):
+        raise ValueError(f"k must have shape [{q.shape[0]}, {rope_dim}], got {tuple(k.shape)}.")
+    if q_out.shape != q.shape:
+        raise ValueError(f"q_out must have shape {tuple(q.shape)}, got {tuple(q_out.shape)}.")
+    if positions.ndim != 1 or positions.shape[0] < q.shape[0]:
+        raise ValueError(
+            f"positions must contain at least {q.shape[0]} entries, got {tuple(positions.shape)}."
+        )
+    if positions.dtype not in (torch.int32, torch.int64):
+        raise TypeError(f"positions must use int32 or int64, got {positions.dtype}.")
+    required_table_size = max_positions * rope_dim * 2
+    if rotary_cos_sin.numel() < required_table_size:
+        raise ValueError(
+            f"rotary_cos_sin has {rotary_cos_sin.numel()} elements, need at least {required_table_size}."
+        )
+    tensors = (q, k, q_out, positions, rotary_cos_sin)
+    if any(tensor.device != q.device for tensor in tensors[1:]):
+        raise ValueError("q, k, q_out, positions, and rotary_cos_sin must be on the same device.")
+
+    num_tokens, num_heads, _ = q.shape
+    if num_tokens == 0:
+        return
+    use_fused_kernel = (
+        q.is_cuda
+        and q.dtype == torch.bfloat16
+        and k.dtype == torch.bfloat16
+        and q_out.dtype == torch.bfloat16
+        and rotary_cos_sin.dtype == torch.float32
+    )
+    if not use_fused_kernel:
+        q_out.copy_(apply_fp4_mla_rope(q, positions, rotary_cos_sin, max_positions, rope_dim))
+        k.copy_(
+            apply_fp4_mla_rope(
+                k.unsqueeze(1), positions, rotary_cos_sin, max_positions, rope_dim
+            ).squeeze(1)
+        )
+        return
+
+    block_h = 4
+    block_pairs = triton.next_power_of_2(rope_dim // 2)
+    _fp4_mla_rope_qk_kernel[(num_tokens, triton.cdiv(num_heads, block_h))](
+        q,
+        k,
+        q_out,
+        positions,
+        rotary_cos_sin,
+        num_heads,
+        q.stride(0),
+        q.stride(1),
+        q.stride(2),
+        k.stride(0),
+        k.stride(1),
+        q_out.stride(0),
+        q_out.stride(1),
+        q_out.stride(2),
+        positions.stride(0),
+        ROPE_DIM=rope_dim,
+        BLOCK_H=block_h,
+        BLOCK_PAIRS=block_pairs,
+        num_warps=4,
+    )
 
 
 def _host_int_list_during_forward(value: Any, start: int, end: int) -> Optional[list[int]]:
@@ -592,6 +799,39 @@ def _fp4_mla_uniform_generation_lengths(
     prompt_lens_gen = metadata.prompt_lens_cuda_runtime[num_contexts:num_seqs]
     if num_gen <= 0 or num_gen_tokens % num_gen != 0:
         return kv_lens_gen, prompt_lens_gen
+    corrected_kv_lens = getattr(metadata, "fp4_mla_generation_kv_lens", None)
+    generation_lens = getattr(metadata, "fp4_mla_generation_append_lens", None)
+    precomputed = (
+        corrected_kv_lens is not None
+        and generation_lens is not None
+        and corrected_kv_lens.numel() >= num_gen
+        and generation_lens.numel() >= num_gen
+        and getattr(metadata, "fp4_mla_generation_lengths_num_tokens", -1) == num_gen_tokens
+        and getattr(metadata, "fp4_mla_generation_lengths_num_seqs", -1) == num_gen
+        and getattr(metadata, "fp4_mla_generation_lengths_num_contexts", -1) == num_contexts
+    )
+    if precomputed:
+        return corrected_kv_lens[:num_gen], generation_lens[:num_gen]
+    can_populate = (
+        corrected_kv_lens is not None
+        and generation_lens is not None
+        and corrected_kv_lens.numel() >= num_gen
+        and generation_lens.numel() >= num_gen
+        and kv_lens_gen.is_cuda
+    )
+    if can_populate:
+        populate_fp4_mla_generation_lengths(
+            kv_lens_gen,
+            prompt_lens_gen,
+            corrected_kv_lens[:num_gen],
+            generation_lens[:num_gen],
+            num_gen_tokens=num_gen_tokens,
+            num_gen=num_gen,
+        )
+        metadata.fp4_mla_generation_lengths_num_tokens = num_gen_tokens
+        metadata.fp4_mla_generation_lengths_num_seqs = num_gen
+        metadata.fp4_mla_generation_lengths_num_contexts = num_contexts
+        return corrected_kv_lens[:num_gen], generation_lens[:num_gen]
     per_seq = num_gen_tokens // num_gen
     cached = kv_lens_gen - prompt_lens_gen
     return cached + per_seq, torch.full_like(prompt_lens_gen, per_seq)
@@ -2402,8 +2642,7 @@ def run_fp4_mla_attention_decode(
     metadata: Any,
     layer_idx: int,
     local_layer: int,
-    q_nope: torch.Tensor,
-    q_pe: torch.Tensor,
+    q: torch.Tensor,
     output: torch.Tensor,
     *,
     sm_scale: float,
@@ -2412,11 +2651,11 @@ def run_fp4_mla_attention_decode(
 ) -> None:
     """Run MLA decode with FP4 QK and FP4 PV tensor-core matmuls.
 
-    Q is quantized to FP4, QK reads the packed K-view cache with swizzled
-    block scales, softmax probabilities are quantized to FP4 per page, and PV
-    repacks V nibbles from the shared KV cache while reading the auxiliary
-    V-view scale pool.  No BF16 dequantized KV workspace is materialized on
-    this path.
+    Q is supplied in its assembled ``[latent, RoPE]`` layout and quantized to
+    FP4 directly. QK reads the packed K-view cache with swizzled block scales,
+    softmax probabilities are quantized to FP4 per page, and PV repacks V
+    nibbles from the shared KV cache while reading the auxiliary V-view scale
+    pool. No BF16 dequantized KV workspace is materialized on this path.
     """
     head_dim = kv_lora_rank + qk_rope_head_dim
     _validate_fp4_mla_cache_shape(metadata.page_size, head_dim)
@@ -2426,7 +2665,15 @@ def run_fp4_mla_attention_decode(
             f"got {metadata.page_size}."
         )
 
-    num_queries = q_nope.shape[0]
+    if q.ndim != 3 or q.shape[-1] != head_dim:
+        raise ValueError(
+            "FP4 MLA attention Q must have shape "
+            f"[tokens, heads, {head_dim}], got {tuple(q.shape)}."
+        )
+    if not q.is_contiguous():
+        raise ValueError("FP4 MLA attention Q must be contiguous.")
+
+    num_queries = q.shape[0]
     if num_queries == 0:
         return
     num_gen_seqs = metadata.num_seqs - metadata.num_contexts
@@ -2436,20 +2683,9 @@ def run_fp4_mla_attention_decode(
         num_gen_seqs=num_gen_seqs,
     )
 
-    num_heads = q_nope.shape[1]
-    if q_pe.shape[:2] != (num_queries, num_heads):
-        raise ValueError("FP4 MLA attention q_nope/q_pe batch dimensions do not match.")
+    num_heads = q.shape[1]
     if output.shape[:2] != (num_queries, num_heads):
         raise ValueError("FP4 MLA attention output batch dimensions do not match.")
-    if q_nope.shape[-1] != kv_lora_rank:
-        raise ValueError(
-            f"q_nope last dimension must be kv_lora_rank={kv_lora_rank}, got {q_nope.shape[-1]}."
-        )
-    if q_pe.shape[-1] != qk_rope_head_dim:
-        raise ValueError(
-            f"q_pe last dimension must be qk_rope_head_dim={qk_rope_head_dim}, "
-            f"got {q_pe.shape[-1]}."
-        )
 
     if getattr(metadata, "fp4_mla_v_scale_pool", None) is None:
         raise RuntimeError(
@@ -2459,20 +2695,11 @@ def run_fp4_mla_attention_decode(
     backend = _fp4_mla_attention_backend()
     _validate_fp4_mla_dynamic_scale_backend()
     dynamic_global_scale = fp4_mla_dynamic_global_scale_enabled()
-    global_scale = _get_fp4_mla_global_scale(metadata, q_nope.device)
+    global_scale = _get_fp4_mla_global_scale(metadata, q.device)
     q_residual_dim = FP4_MLA_Q_RESIDUAL_DIM
     _validate_fp4_mla_attention_q_shape(head_dim, q_residual_dim)
 
-    q_full = _ensure_workspace_tensor(
-        metadata,
-        "_fp4_mla_attention_q_buf",
-        (num_queries, num_heads, head_dim),
-        dtype=q_nope.dtype,
-        device=q_nope.device,
-    )
-    q_full[..., :kv_lora_rank].copy_(q_nope)
-    q_full[..., kv_lora_rank:].copy_(q_pe)
-    q_2d = q_full.reshape(num_queries * num_heads, head_dim)
+    q_2d = q.view(num_queries * num_heads, head_dim)
     if q_2d.dtype not in (torch.bfloat16, torch.float8_e4m3fn):
         raise TypeError(
             f"FP4 MLA residual Q quantization requires BF16 or FP8 Q; got {q_2d.dtype}."
@@ -2538,14 +2765,14 @@ def run_fp4_mla_attention_decode(
             "_fp4_mla_attention_p_buf",
             (max(total_p_rows, 1), metadata.page_size // 2),
             dtype=torch.uint8,
-            device=q_nope.device,
+            device=q.device,
         )[:total_p_rows]
         p_sf = _ensure_workspace_tensor(
             metadata,
             "_fp4_mla_attention_p_sf_buf",
             (max(_get_fp4_mla_swizzled_scale_size(total_p_rows, metadata.page_size), 1),),
             dtype=torch.float8_e4m3fn,
-            device=q_nope.device,
+            device=q.device,
         )
         stats_shape = (num_queries, num_heads)
         max_scores = _ensure_workspace_tensor(
@@ -2553,14 +2780,14 @@ def run_fp4_mla_attention_decode(
             "_fp4_mla_attention_max_buf",
             stats_shape,
             dtype=torch.float32,
-            device=q_nope.device,
+            device=q.device,
         )
         denom = _ensure_workspace_tensor(
             metadata,
             "_fp4_mla_attention_denom_buf",
             stats_shape,
             dtype=torch.float32,
-            device=q_nope.device,
+            device=q.device,
         )
         page_max = None
         page_sum = None
@@ -2571,14 +2798,14 @@ def run_fp4_mla_attention_decode(
                 "_fp4_mla_attention_page_max_buf",
                 page_stats_shape,
                 dtype=torch.float32,
-                device=q_nope.device,
+                device=q.device,
             )
             page_sum = _ensure_workspace_tensor(
                 metadata,
                 "_fp4_mla_attention_page_sum_buf",
                 page_stats_shape,
                 dtype=torch.float32,
-                device=q_nope.device,
+                device=q.device,
             )
         cutile_storage_full_pages = _infer_cutile_assume_full_pages(
             metadata,
@@ -2647,7 +2874,7 @@ def run_fp4_mla_attention_decode(
                     metadata.page_size // 2,
                 ),
                 dtype=torch.uint8,
-                device=q_nope.device,
+                device=q.device,
             )
         mark_cutile_v_packed_cache_valid = bool(
             cutile_prepack_v_for_pv
@@ -2711,14 +2938,14 @@ def run_fp4_mla_attention_decode(
         "_fp4_mla_attention_p_buf",
         (max(total_p_rows, 1), metadata.page_size // 2),
         dtype=torch.uint8,
-        device=q_nope.device,
+        device=q.device,
     )[:total_p_rows]
     p_sf = _ensure_workspace_tensor(
         metadata,
         "_fp4_mla_attention_p_sf_buf",
         (max(_get_fp4_mla_swizzled_scale_size(total_p_rows, metadata.page_size), 1),),
         dtype=torch.float8_e4m3fn,
-        device=q_nope.device,
+        device=q.device,
     )
     stats_shape = (num_queries, num_heads)
     max_scores = _ensure_workspace_tensor(
@@ -2726,14 +2953,14 @@ def run_fp4_mla_attention_decode(
         "_fp4_mla_attention_max_buf",
         stats_shape,
         dtype=torch.float32,
-        device=q_nope.device,
+        device=q.device,
     )
     denom = _ensure_workspace_tensor(
         metadata,
         "_fp4_mla_attention_denom_buf",
         stats_shape,
         dtype=torch.float32,
-        device=q_nope.device,
+        device=q.device,
     )
 
     if backend != "triton":

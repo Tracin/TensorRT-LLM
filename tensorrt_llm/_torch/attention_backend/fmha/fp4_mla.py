@@ -417,16 +417,13 @@ class Fp4MlaFmha(PhasedFmha):
         update_hp_kv_for_fp4_mla(meta, fwd.latent_cache, local_layer, phase="generation")
 
         query = params.qkv_input.view(params.num_tokens, attn.num_heads, fused_head_dim)
-        q_nope = query[..., :kv_lora_rank]
-        q_pe = query[..., kv_lora_rank:]
         output = params.context_buf.view(params.num_tokens, attn.num_heads, kv_lora_rank)
         sm_scale = 1.0 / (attn.q_scaling * (attn.qk_nope_head_dim + qk_rope_head_dim) ** 0.5)
         run_fp4_mla_attention_decode(
             meta,
             attn.layer_idx,
             local_layer,
-            q_nope,
-            q_pe,
+            query,
             output,
             sm_scale=sm_scale,
             kv_lora_rank=kv_lora_rank,

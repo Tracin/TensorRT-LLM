@@ -22,16 +22,20 @@ from tensorrt_llm._torch.attention_backend.fp4_mla import (
     HP_BLOCK_SIZE,
     _cutile_backend_available,
     _dynamic_fp4_mla_q_scale,
+    _fp4_mla_uniform_generation_lengths,
     _get_cutile_v_packed_cache,
     _maybe_update_cutile_v_packed_cache,
     _snapshot_hp_kv_for_mtp_generation,
     _validate_fp4_mla_dynamic_scale_backend,
+    apply_fp4_mla_rope,
+    apply_fp4_mla_rope_qk,
     fp4_mla_dynamic_global_scale_enabled,
     get_fp4_mla_hp_block_size,
     get_fp4_mla_kv_global_scale_pool_view,
     get_fp4_mla_v_scale_pool_shape,
     get_fp4_mla_v_scale_pool_size,
     get_fp4_mla_v_scale_pool_view,
+    populate_fp4_mla_generation_lengths,
     repair_fp4_mla_hp_kv_for_mtp_rejection,
     run_fp4_mla_attention_decode,
     scatter_fp4_mla_kv_cache,
@@ -553,13 +557,13 @@ def _assert_fp4_mla_attention_decode_accuracy(
     )
     try:
         output = torch.empty_like(q_nope)
+        q = torch.cat((q_nope, q_pe), dim=-1)
         sm_scale = 0.1
         run_fp4_mla_attention_decode(
             metadata,
             layer_idx=0,
             local_layer=0,
-            q_nope=q_nope,
-            q_pe=q_pe,
+            q=q,
             output=output,
             sm_scale=sm_scale,
             kv_lora_rank=kv_lora_rank,
@@ -1088,6 +1092,121 @@ def test_fp4_mla_rope_resize_checks_layer_table_capacity():
     assert attention.rotary_cos_sin.numel() == 10 * rope_params.dim * 2
 
 
+def test_fp4_mla_rope_accepts_int32_positions():
+    torch.manual_seed(7)
+    target = torch.randn(2, 3, 8, dtype=torch.bfloat16)
+    rotary_cos_sin = torch.randn(4, 8, 2, dtype=torch.float32)
+    positions = torch.tensor([1, 3], dtype=torch.int32)
+
+    actual = apply_fp4_mla_rope(
+        target,
+        positions,
+        rotary_cos_sin,
+        max_positions=4,
+        rope_dim=8,
+    )
+    expected = apply_fp4_mla_rope(
+        target,
+        positions.to(torch.int64),
+        rotary_cos_sin,
+        max_positions=4,
+        rope_dim=8,
+    )
+
+    torch.testing.assert_close(actual, expected)
+
+
+def test_fp4_mla_generation_lengths_reuse_precomputed_buffers():
+    corrected_kv_lens = torch.tensor([14, 29], dtype=torch.int32)
+    generation_lens = torch.tensor([3, 3], dtype=torch.int32)
+    metadata = SimpleNamespace(
+        num_contexts=1,
+        num_seqs=3,
+        kv_lens_cuda_runtime=torch.tensor([7, 12, 27], dtype=torch.int32),
+        prompt_lens_cuda_runtime=torch.tensor([2, 1, 1], dtype=torch.int32),
+        fp4_mla_generation_kv_lens=corrected_kv_lens,
+        fp4_mla_generation_append_lens=generation_lens,
+        fp4_mla_generation_lengths_num_tokens=6,
+        fp4_mla_generation_lengths_num_seqs=2,
+        fp4_mla_generation_lengths_num_contexts=1,
+    )
+
+    actual_kv_lens, actual_generation_lens = _fp4_mla_uniform_generation_lengths(
+        metadata, num_gen_tokens=6, num_gen=2
+    )
+
+    assert actual_kv_lens.data_ptr() == corrected_kv_lens.data_ptr()
+    assert actual_generation_lens.data_ptr() == generation_lens.data_ptr()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_fp4_mla_generation_lengths_kernel_matches_reference():
+    device = torch.device("cuda")
+    kv_lens = torch.tensor([12, 27, 41], dtype=torch.int32, device=device)
+    prompt_lens = torch.tensor([1, 1, 1], dtype=torch.int32, device=device)
+    corrected_kv_lens = torch.empty_like(kv_lens)
+    generation_lens = torch.empty_like(prompt_lens)
+
+    populate_fp4_mla_generation_lengths(
+        kv_lens,
+        prompt_lens,
+        corrected_kv_lens,
+        generation_lens,
+        num_gen_tokens=9,
+        num_gen=3,
+    )
+
+    torch.testing.assert_close(
+        corrected_kv_lens,
+        torch.tensor([14, 29, 43], dtype=torch.int32, device=device),
+    )
+    torch.testing.assert_close(
+        generation_lens,
+        torch.full((3,), 3, dtype=torch.int32, device=device),
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_fp4_mla_fused_rope_qk_matches_reference():
+    torch.manual_seed(11)
+    device = torch.device("cuda")
+    num_tokens = 3
+    num_heads = 7
+    rope_dim = 8
+    max_positions = 12
+    positions = torch.tensor([1, 5, 11], dtype=torch.int32, device=device)
+    rotary_cos_sin = torch.randn(max_positions, rope_dim, 2, dtype=torch.float32, device=device)
+
+    q_storage = torch.randn(
+        num_tokens, num_heads, rope_dim + 3, dtype=torch.bfloat16, device=device
+    )
+    q = q_storage[..., :rope_dim]
+    k_storage = torch.randn(num_tokens, rope_dim + 5, dtype=torch.bfloat16, device=device)
+    k = k_storage[..., 2 : 2 + rope_dim]
+    q_out_storage = torch.empty(
+        num_tokens, num_heads, rope_dim + 4, dtype=torch.bfloat16, device=device
+    )
+    q_out = q_out_storage[..., 3 : 3 + rope_dim]
+
+    expected_q = apply_fp4_mla_rope(q, positions, rotary_cos_sin, max_positions, rope_dim)
+    expected_k = apply_fp4_mla_rope(
+        k.clone().unsqueeze(1), positions, rotary_cos_sin, max_positions, rope_dim
+    ).squeeze(1)
+
+    apply_fp4_mla_rope_qk(
+        q,
+        k,
+        q_out,
+        positions,
+        rotary_cos_sin,
+        max_positions,
+        rope_dim,
+    )
+
+    torch.testing.assert_close(q_out, expected_q)
+    torch.testing.assert_close(k, expected_k)
+
+
 @pytest.mark.skipif(_is_pre_blackwell(), reason="requires Blackwell FP4 support")
 def test_fp4_mla_real_scatter_writes_shared_2d_scales():
     torch.manual_seed(4)
@@ -1350,14 +1469,14 @@ def _fp4_mla_attention_decode_residual_qk_duplicates_k_tail_impl(monkeypatch):
             .to(torch.bfloat16)
         )
         output = torch.empty(1, num_heads, kv_lora_rank, dtype=torch.bfloat16, device=device)
+        q = torch.cat((q_nope, q_pe), dim=-1)
         sm_scale = 0.1
 
         run_fp4_mla_attention_decode(
             metadata,
             layer_idx=0,
             local_layer=0,
-            q_nope=q_nope,
-            q_pe=q_pe,
+            q=q,
             output=output,
             sm_scale=sm_scale,
             kv_lora_rank=kv_lora_rank,
@@ -1365,7 +1484,7 @@ def _fp4_mla_attention_decode_residual_qk_duplicates_k_tail_impl(monkeypatch):
         )
         torch.cuda.synchronize()
 
-        q_full = torch.cat((q_nope, q_pe), dim=-1).reshape(num_heads, head_dim)
+        q_full = q.reshape(num_heads, head_dim)
         q_fp4, q_sf = torch.ops.trtllm.fp4_quantize_with_residual(
             q_full,
             metadata._fp4_mla_global_scale,
@@ -1706,7 +1825,7 @@ def _estimate_fp4_mla_attention_decode_mbu_bytes(
     v_fp4_bytes_per_token = kv_lora_rank // 2 + _ceil_div(kv_lora_rank, fp4_block_size)
     p_bytes_per_seq = padded_seq_len // 2 + _ceil_div(padded_seq_len, fp4_block_size)
 
-    q_setup_bytes = q_rows * q_input_dim * bf16_bytes * 3 + q_rows * qk_fp4_bytes_per_token
+    q_setup_bytes = q_rows * q_input_dim * bf16_bytes + q_rows * qk_fp4_bytes_per_token
     qk_cache_bytes = 2 * batch_size * head_blocks * padded_seq_len * qk_fp4_bytes_per_token
     qk_q_bytes = 2 * batch_size * num_heads * pages_per_seq * qk_fp4_bytes_per_token
     stats_bytes = batch_size * num_heads * 2 * fp32_bytes * (1 + pages_per_seq)
@@ -1752,14 +1871,14 @@ def test_fp4_mla_attention_decode_perf_benchmark(batch_size, seq_len, monkeypatc
     )
     try:
         output = torch.empty_like(q_nope)
+        q = torch.cat((q_nope, q_pe), dim=-1)
 
         def run_decode():
             run_fp4_mla_attention_decode(
                 metadata,
                 layer_idx=0,
                 local_layer=0,
-                q_nope=q_nope,
-                q_pe=q_pe,
+                q=q,
                 output=output,
                 sm_scale=0.1,
                 kv_lora_rank=kv_lora_rank,

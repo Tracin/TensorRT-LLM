@@ -38,7 +38,7 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 from ..utils import (compute_swizzled_sf_shape, get_global_attrs,
                      get_model_extra_attrs)
 from .fp4_mla import (FP4_MLA_KV_GLOBAL_SCALE, HP_BLOCK_SIZE,
-                      apply_fp4_mla_rope, get_fp4_mla_hp_block_size)
+                      apply_fp4_mla_rope_qk, get_fp4_mla_hp_block_size)
 from .interface import (AttentionBackend, AttentionForwardArgs,
                         AttentionInputType, AttentionMask, AttentionMetadata,
                         KVCacheParams, MLAParams, PositionalEmbeddingParams,
@@ -169,6 +169,11 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     _fp4_mla_global_scale: Optional[torch.Tensor] = None
     batch_indices: Optional[torch.Tensor] = None
     positions: Optional[torch.Tensor] = None
+    fp4_mla_generation_kv_lens: Optional[torch.Tensor] = None
+    fp4_mla_generation_append_lens: Optional[torch.Tensor] = None
+    fp4_mla_generation_lengths_num_tokens: int = field(init=False, default=-1)
+    fp4_mla_generation_lengths_num_seqs: int = field(init=False, default=-1)
+    fp4_mla_generation_lengths_num_contexts: int = field(init=False, default=-1)
     _paged_kv_indptr: Optional[torch.Tensor] = None
     paged_kv_indptr_decode: Optional[torch.Tensor] = None
     _paged_kv_indices: Optional[torch.Tensor] = None
@@ -528,6 +533,20 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 dtype=torch.int32,
                 capture_graph=capture_graph,
             )
+            self.fp4_mla_generation_kv_lens = self.get_empty(
+                buffers,
+                (self.max_num_sequences, ),
+                cache_name="fp4_mla_generation_kv_lens",
+                dtype=torch.int32,
+                capture_graph=capture_graph,
+            )
+            self.fp4_mla_generation_append_lens = self.get_empty(
+                buffers,
+                (self.max_num_sequences, ),
+                cache_name="fp4_mla_generation_append_lens",
+                dtype=torch.int32,
+                capture_graph=capture_graph,
+            )
             self._paged_kv_indices = self.get_empty(
                 buffers,
                 (self.kv_cache_manager.blocks_in_primary_pool, ),
@@ -600,6 +619,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
 
     def _update_fp4_mla_append_metadata(self) -> None:
         if self.high_precision_kv_pool is not None and self.num_tokens > 0:
+            self._invalidate_fp4_mla_generation_lengths()
             self._populate_fp4_mla_batch_indices_positions()
 
     def update_for_spec_dec(self) -> None:
@@ -758,6 +778,13 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         self.kv_lens_runtime = kv_lens[:num_seqs]
         self.prompt_lens_cuda_runtime = self.seq_lens_kv_cuda[:num_seqs]
         self.prompt_lens_cpu_runtime = self.seq_lens_kv[:num_seqs]
+        self._invalidate_fp4_mla_generation_lengths()
+
+    def _invalidate_fp4_mla_generation_lengths(self) -> None:
+        """Invalidate generation lengths before the next FP4 MLA forward step."""
+        self.fp4_mla_generation_lengths_num_tokens = -1
+        self.fp4_mla_generation_lengths_num_seqs = -1
+        self.fp4_mla_generation_lengths_num_contexts = -1
 
     def _populate_fp4_mla_page_metadata(self, kv_lens: torch.Tensor) -> None:
         """Build the compact page table consumed by FP4 MLA helper kernels."""
@@ -2248,30 +2275,15 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
 
         num_tokens = q_pe.shape[0]
         token_offset = getattr(metadata, "num_ctx_tokens", 0)
-        positions = metadata.positions[token_offset:token_offset +
-                                       num_tokens].to(torch.long)
-        if num_tokens > 0 and torch.cuda.is_current_stream_capturing():
-            max_position = metadata.max_seq_len
-        elif num_tokens > 0:
-            max_position = int(positions.max().item()) + 1
-        else:
-            max_position = 0
-        self._ensure_rope_table_size(max(max_position, metadata.max_seq_len))
+        positions = metadata.positions[token_offset:token_offset + num_tokens]
 
-        q_roped = apply_fp4_mla_rope(
+        k_pe = latent_cache[..., self.kv_lora_rank:]
+        apply_fp4_mla_rope_qk(
             q_pe,
+            k_pe,
+            fused_q[..., self.kv_lora_rank:],
             positions,
             self.rotary_cos_sin,
             self.rope_params.max_positions,
             self.qk_rope_head_dim,
         )
-        k_pe = latent_cache[..., self.kv_lora_rank:]
-        k_roped = apply_fp4_mla_rope(
-            k_pe.unsqueeze(1),
-            positions,
-            self.rotary_cos_sin,
-            self.rope_params.max_positions,
-            self.qk_rope_head_dim,
-        ).squeeze(1)
-        fused_q[..., self.kv_lora_rank:].copy_(q_roped.to(fused_q.dtype))
-        k_pe.copy_(k_roped.to(k_pe.dtype))
