@@ -797,11 +797,21 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         num_blocks_tensor = ((kv_lens[:self.num_seqs] + self.page_size - 1) //
                              self.page_size)
         self.num_blocks = [int(item) for item in num_blocks_tensor.tolist()]
-        self.num_context_blocks = sum(self.num_blocks[:self.num_contexts])
-        self.num_generation_blocks = sum(self.num_blocks[self.num_contexts:])
 
         block_ids_per_seq = self.kv_cache_manager.get_batch_cache_indices(
             self.request_ids)
+        # Under the overlap scheduler the host kv_lens assume the previous
+        # step accepted every draft token, while the KV cache manager may
+        # already have rewound rejected drafts and freed the trailing block.
+        # Clamp each sequence's block count to what is actually allocated so
+        # the flattened page table stays aligned with paged_kv_indptr;
+        # device-corrected positions never address the clamped-away page.
+        for seq_idx, block_ids in enumerate(block_ids_per_seq):
+            if len(block_ids) < self.num_blocks[seq_idx]:
+                self.num_blocks[seq_idx] = len(block_ids)
+        self.num_context_blocks = sum(self.num_blocks[:self.num_contexts])
+        self.num_generation_blocks = sum(self.num_blocks[self.num_contexts:])
+
         paged_kv_indices_list = []
         for seq_idx, block_ids in enumerate(block_ids_per_seq):
             paged_kv_indices_list.extend(block_ids[:self.num_blocks[seq_idx]])
