@@ -955,13 +955,17 @@ def _fp4_mla_v_scale_store_hp_tail_kernel(
 
 
 @triton.jit
-def _fp4_mla_v_scale_store_generation_tiles_kernel(
+def _fp4_mla_generation_fused_qk_rope_cache_update_kernel(
     kv_cache_ptr,
     sf_cache_ptr,
     v_sf_ptr,
     hp_pool_ptr,
     latent_cache_ptr,
     global_scale_ptr,
+    positions_ptr,
+    rotary_cos_sin_ptr,
+    q_pe_ptr,
+    q_rope_out_ptr,
     seq_slots_ptr,
     kv_lens_ptr,
     prompt_lens_ptr,
@@ -985,6 +989,14 @@ def _fp4_mla_v_scale_store_generation_tiles_kernel(
     vsf_s0,
     vsf_s1,
     global_scale_s0,
+    position_token_offset,
+    positions_len,
+    q_pe_s0,
+    q_pe_s1,
+    q_pe_s2,
+    q_out_s0,
+    q_out_s1,
+    q_out_s2,
     HEAD_D: tl.constexpr,
     V_HEAD_D: tl.constexpr,
     HP_BLOCK: tl.constexpr,
@@ -994,48 +1006,105 @@ def _fp4_mla_v_scale_store_generation_tiles_kernel(
     SF_PER_PAGE: tl.constexpr,
     REWRITE_PAGE: tl.constexpr,
     KV_GLOBAL_SCALE_PER_PAGE: tl.constexpr,
+    FUSE_ROPE_CACHE_STORE: tl.constexpr,
+    MAX_GEN_TILES: tl.constexpr,
+    ROPE_DIM: tl.constexpr,
+    ROPE_PAIR_BLOCK: tl.constexpr,
+    NUM_DIM_BLOCKS: tl.constexpr,
+    NUM_Q_HEADS: tl.constexpr,
+    Q_HEAD_BLOCKS: tl.constexpr,
+    BLOCK_Q_HEADS: tl.constexpr,
 ):
     seq_idx = tl.program_id(0)
-    tile_idx = tl.program_id(1)
-    dim_block = tl.program_id(2)
     if (local_layer < 0) | (local_layer >= num_layers):
         return
     if seq_idx + 1 >= indptr_len:
         return
-
-    kv_len = tl.load(kv_lens_ptr + seq_idx)
     gen_len = tl.load(prompt_lens_ptr + seq_idx)
     if gen_len <= 0:
         return
+    if FUSE_ROPE_CACHE_STORE:
+        work_idx = tl.program_id(1)
+        if work_idx >= NUM_DIM_BLOCKS:
+            q_program = work_idx - NUM_DIM_BLOCKS
+            q_token_idx = q_program // Q_HEAD_BLOCKS
+            q_head_block = q_program - q_token_idx * Q_HEAD_BLOCKS
+            if q_token_idx < gen_len:
+                q_token = seq_idx * gen_len + q_token_idx
+                position_idx = position_token_offset + q_token
+                valid_position = (position_idx >= 0) & (position_idx < positions_len)
+                position = tl.load(
+                    positions_ptr + position_idx,
+                    mask=valid_position,
+                    other=0,
+                ).to(tl.int64)
+                head_offsets = q_head_block * BLOCK_Q_HEADS + tl.arange(0, BLOCK_Q_HEADS)
+                pair_offsets = tl.arange(0, ROPE_PAIR_BLOCK)
+                pair_mask = pair_offsets < ROPE_DIM // 2
+                q_mask = valid_position & (head_offsets[:, None] < NUM_Q_HEADS) & pair_mask[None, :]
+                rotary_offsets = position * (ROPE_DIM * 2) + pair_offsets * 2
+                cos = (
+                    tl.load(
+                        rotary_cos_sin_ptr + rotary_offsets,
+                        mask=valid_position & pair_mask,
+                        other=0.0,
+                    )
+                    .to(tl.bfloat16)
+                    .to(tl.float32)
+                )
+                sin = (
+                    tl.load(
+                        rotary_cos_sin_ptr + rotary_offsets + 1,
+                        mask=valid_position & pair_mask,
+                        other=0.0,
+                    )
+                    .to(tl.bfloat16)
+                    .to(tl.float32)
+                )
+                q_base = q_token * q_pe_s0 + head_offsets[:, None].to(tl.int64) * q_pe_s1
+                q_even_offsets = q_base + (pair_offsets[None, :] * 2).to(tl.int64) * q_pe_s2
+                q_even = tl.load(
+                    q_pe_ptr + q_even_offsets,
+                    mask=q_mask,
+                    other=0.0,
+                ).to(tl.float32)
+                q_odd = tl.load(
+                    q_pe_ptr + q_even_offsets + q_pe_s2,
+                    mask=q_mask,
+                    other=0.0,
+                ).to(tl.float32)
+                q_even_cos = (q_even * cos[None, :]).to(tl.bfloat16).to(tl.float32)
+                q_odd_sin = (q_odd * sin[None, :]).to(tl.bfloat16).to(tl.float32)
+                q_odd_cos = (q_odd * cos[None, :]).to(tl.bfloat16).to(tl.float32)
+                q_even_sin = (q_even * sin[None, :]).to(tl.bfloat16).to(tl.float32)
+                q_roped_even = (q_even_cos - q_odd_sin).to(tl.bfloat16)
+                q_roped_odd = (q_odd_cos + q_even_sin).to(tl.bfloat16)
+                q_out_base = q_token * q_out_s0 + head_offsets[:, None].to(tl.int64) * q_out_s1
+                q_out_even_offsets = (
+                    q_out_base + (pair_offsets[None, :] * 2).to(tl.int64) * q_out_s2
+                )
+                tl.store(
+                    q_rope_out_ptr + q_out_even_offsets,
+                    q_roped_even,
+                    mask=q_mask,
+                )
+                tl.store(
+                    q_rope_out_ptr + q_out_even_offsets + q_out_s2,
+                    q_roped_odd,
+                    mask=q_mask,
+                )
+            return
+        dim_block = work_idx
+    else:
+        dim_block = tl.program_id(2)
+    kv_len = tl.load(kv_lens_ptr + seq_idx)
     first_new_pos = kv_len - gen_len
     if REWRITE_PAGE:
         first_tile_pos = (first_new_pos // page_size) * page_size
     else:
         first_tile_pos = (first_new_pos // HP_BLOCK) * HP_BLOCK
-    block_base_pos = first_tile_pos + tile_idx * HP_BLOCK
-    if block_base_pos >= kv_len:
-        return
-    if not REWRITE_PAGE:
-        if block_base_pos + HP_BLOCK <= first_new_pos:
-            return
-
-    page_idx = block_base_pos // page_size
-    page_pos = block_base_pos - page_idx * page_size
     page_start = tl.load(paged_kv_indptr_ptr + seq_idx).to(tl.int64)
     page_end = tl.load(paged_kv_indptr_ptr + seq_idx + 1).to(tl.int64)
-    physical_page_offset = page_start + page_idx
-    if (
-        (page_pos < 0)
-        | (page_pos >= page_size)
-        | (physical_page_offset < page_start)
-        | (physical_page_offset >= page_end)
-        | (physical_page_offset < 0)
-        | (physical_page_offset >= page_ids_len)
-    ):
-        return
-    physical_page = tl.load(page_ids_ptr + physical_page_offset).to(tl.int64)
-    if (physical_page < 0) | (physical_page >= num_pages):
-        return
     seq_slot = tl.load(seq_slots_ptr + seq_idx).to(tl.int64)
     if (seq_slot < 0) | (seq_slot >= num_seq_slots):
         return
@@ -1052,93 +1121,192 @@ def _fp4_mla_v_scale_store_generation_tiles_kernel(
     safe_odd_d = tl.where(mask_odd_d, odd_d, 0)
     safe_all_d = tl.where(mask_all_d, all_d, 0)
 
-    abs_positions = block_base_pos + token_offsets
-    valid_tokens = abs_positions < kv_len
-    from_latent = abs_positions >= first_new_pos
-    hp_slots = abs_positions % HP_POOL_SIZE
-    new_token_offsets = abs_positions - first_new_pos
-    # Linear MTP uses a uniform generation length, so each sequence occupies a
-    # contiguous gen_len slice in latent_cache.
-    latent_tokens = seq_idx * gen_len + new_token_offsets
-    safe_latent_tokens = tl.where(valid_tokens & from_latent, latent_tokens, 0).to(tl.int64)
+    for tile_iter in tl.static_range(0, MAX_GEN_TILES):
+        if FUSE_ROPE_CACHE_STORE:
+            tile_idx = tile_iter
+        else:
+            tile_idx = tl.program_id(1)
+        block_base_pos = first_tile_pos + tile_idx * HP_BLOCK
+        if block_base_pos >= kv_len:
+            return
+        if not REWRITE_PAGE:
+            if block_base_pos + HP_BLOCK <= first_new_pos:
+                return
 
-    hp_even = tl.load(
-        hp_pool_ptr
-        + seq_slot * pool_s0
-        + local_layer * pool_s1
-        + hp_slots[:, None] * HEAD_D
-        + safe_even_d[None, :],
-        mask=valid_tokens[:, None] & (~from_latent)[:, None] & mask_even_d[None, :],
-        other=0.0,
-    ).to(tl.float32)
-    hp_odd = tl.load(
-        hp_pool_ptr
-        + seq_slot * pool_s0
-        + local_layer * pool_s1
-        + hp_slots[:, None] * HEAD_D
-        + safe_odd_d[None, :],
-        mask=valid_tokens[:, None] & (~from_latent)[:, None] & mask_odd_d[None, :],
-        other=0.0,
-    ).to(tl.float32)
-    latent_even = tl.load(
-        latent_cache_ptr + safe_latent_tokens[:, None] * lc_s0 + safe_even_d[None, :] * lc_s1,
-        mask=valid_tokens[:, None] & from_latent[:, None] & mask_even_d[None, :],
-        other=0.0,
-    ).to(tl.float32)
-    latent_odd = tl.load(
-        latent_cache_ptr + safe_latent_tokens[:, None] * lc_s0 + safe_odd_d[None, :] * lc_s1,
-        mask=valid_tokens[:, None] & from_latent[:, None] & mask_odd_d[None, :],
-        other=0.0,
-    ).to(tl.float32)
-    even_values = hp_even + latent_even
-    odd_values = hp_odd + latent_odd
+        page_idx = block_base_pos // page_size
+        page_pos = block_base_pos - page_idx * page_size
+        physical_page_offset = page_start + page_idx
+        if (
+            (page_pos < 0)
+            | (page_pos >= page_size)
+            | (physical_page_offset < page_start)
+            | (physical_page_offset >= page_end)
+            | (physical_page_offset < 0)
+            | (physical_page_offset >= page_ids_len)
+        ):
+            return
+        physical_page = tl.load(page_ids_ptr + physical_page_offset).to(tl.int64)
+        if (physical_page < 0) | (physical_page >= num_pages):
+            return
 
-    amax_per_token = tl.maximum(
-        tl.max(tl.abs(even_values), axis=1),
-        tl.max(tl.abs(odd_values), axis=1),
-    )
-    tile_amax = tl.max(amax_per_token, axis=0)
-    if KV_GLOBAL_SCALE_PER_PAGE:
-        global_scale = tl.load(global_scale_ptr + physical_page * global_scale_s0)
-    else:
-        global_scale = tl.load(global_scale_ptr)
-    shared_tile = dim_block * FP4_BLOCK < V_HEAD_D
-    tile_scale = tl.where(tile_amax > 0.0, tile_amax / 6.0, 1.0)
-    token_scale = tl.where(amax_per_token > 0.0, amax_per_token / 6.0, 1.0)
-    local_scale = tl.where(shared_tile, tile_scale, token_scale)
-    if KV_GLOBAL_SCALE_PER_PAGE:
-        stored_scale = tl.minimum(local_scale * global_scale, 448.0)
-        v_stored_scale = tl.minimum(tile_scale * global_scale, 448.0)
-    else:
-        stored_scale = local_scale * global_scale
-        v_stored_scale = tile_scale * global_scale
+        abs_positions = block_base_pos + token_offsets
+        valid_tokens = abs_positions < kv_len
+        from_latent = abs_positions >= first_new_pos
+        hp_slots = abs_positions % HP_POOL_SIZE
+        new_token_offsets = abs_positions - first_new_pos
+        # Linear MTP uses a uniform generation length, so each sequence
+        # occupies one contiguous gen_len slice in latent_cache.
+        latent_tokens = seq_idx * gen_len + new_token_offsets
+        safe_latent_tokens = tl.where(valid_tokens & from_latent, latent_tokens, 0).to(tl.int64)
 
-    low = _fp4_e2m1_quantize(even_values / local_scale[:, None])
-    high = _fp4_e2m1_quantize(odd_values / local_scale[:, None])
-    packed = low | (high << 4)
+        hp_even = tl.load(
+            hp_pool_ptr
+            + seq_slot * pool_s0
+            + local_layer * pool_s1
+            + hp_slots[:, None] * HEAD_D
+            + safe_even_d[None, :],
+            mask=valid_tokens[:, None] & (~from_latent)[:, None] & mask_even_d[None, :],
+            other=0.0,
+        ).to(tl.float32)
+        hp_odd = tl.load(
+            hp_pool_ptr
+            + seq_slot * pool_s0
+            + local_layer * pool_s1
+            + hp_slots[:, None] * HEAD_D
+            + safe_odd_d[None, :],
+            mask=valid_tokens[:, None] & (~from_latent)[:, None] & mask_odd_d[None, :],
+            other=0.0,
+        ).to(tl.float32)
+        latent_even = tl.load(
+            latent_cache_ptr + safe_latent_tokens[:, None] * lc_s0 + safe_even_d[None, :] * lc_s1,
+            mask=valid_tokens[:, None] & from_latent[:, None] & mask_even_d[None, :],
+            other=0.0,
+        ).to(tl.float32)
+        latent_odd = tl.load(
+            latent_cache_ptr + safe_latent_tokens[:, None] * lc_s0 + safe_odd_d[None, :] * lc_s1,
+            mask=valid_tokens[:, None] & from_latent[:, None] & mask_odd_d[None, :],
+            other=0.0,
+        ).to(tl.float32)
+        even_values = hp_even + latent_even
+        odd_values = hp_odd + latent_odd
 
-    packed_cols = dim_block * (FP4_BLOCK // 2) + byte_offsets
-    page_positions = page_pos + token_offsets
-    kv_base = physical_page * kv_s0
-    tl.store(
-        kv_cache_ptr + kv_base + page_positions[:, None] * kv_s2 + packed_cols[None, :] * kv_s4,
-        packed,
-        mask=valid_tokens[:, None] & mask_even_d[None, :],
-    )
+        if FUSE_ROPE_CACHE_STORE:
+            position_indices = position_token_offset + safe_latent_tokens
+            valid_position = (
+                valid_tokens
+                & from_latent
+                & (position_indices >= 0)
+                & (position_indices < positions_len)
+            )
+            positions = tl.load(
+                positions_ptr + position_indices,
+                mask=valid_position,
+                other=0,
+            ).to(tl.int64)
+            rope_pair_offsets = (safe_even_d - V_HEAD_D) // 2
+            rope_dim_mask = mask_even_d & (even_d >= V_HEAD_D) & (odd_d < V_HEAD_D + ROPE_DIM)
+            rotary_offsets = positions[:, None] * (ROPE_DIM * 2) + rope_pair_offsets[None, :] * 2
+            rotary_mask = valid_position[:, None] & rope_dim_mask[None, :]
+            cos = (
+                tl.load(
+                    rotary_cos_sin_ptr + rotary_offsets,
+                    mask=rotary_mask,
+                    other=0.0,
+                )
+                .to(tl.bfloat16)
+                .to(tl.float32)
+            )
+            sin = (
+                tl.load(
+                    rotary_cos_sin_ptr + rotary_offsets + 1,
+                    mask=rotary_mask,
+                    other=0.0,
+                )
+                .to(tl.bfloat16)
+                .to(tl.float32)
+            )
+            even_cos = (even_values * cos).to(tl.bfloat16).to(tl.float32)
+            odd_sin = (odd_values * sin).to(tl.bfloat16).to(tl.float32)
+            odd_cos = (odd_values * cos).to(tl.bfloat16).to(tl.float32)
+            even_sin = (even_values * sin).to(tl.bfloat16).to(tl.float32)
+            roped_even = (even_cos - odd_sin).to(tl.bfloat16).to(tl.float32)
+            roped_odd = (odd_cos + even_sin).to(tl.bfloat16).to(tl.float32)
+            even_values = tl.where(rotary_mask, roped_even, even_values)
+            odd_values = tl.where(rotary_mask, roped_odd, odd_values)
 
-    k_sf_offsets = _fp4_mla_swizzled_sf_offset(page_positions, dim_block, SF_PER_TOKEN)
-    tl.store(sf_cache_ptr + physical_page * sf_s0 + k_sf_offsets, stored_scale, mask=valid_tokens)
+        amax_per_token = tl.maximum(
+            tl.max(tl.abs(even_values), axis=1),
+            tl.max(tl.abs(odd_values), axis=1),
+        )
+        tile_amax = tl.max(amax_per_token, axis=0)
+        if KV_GLOBAL_SCALE_PER_PAGE:
+            global_scale = tl.load(global_scale_ptr + physical_page * global_scale_s0)
+        else:
+            global_scale = tl.load(global_scale_ptr)
+        shared_tile = dim_block * FP4_BLOCK < V_HEAD_D
+        tile_scale = tl.where(tile_amax > 0.0, tile_amax / 6.0, 1.0)
+        token_scale = tl.where(amax_per_token > 0.0, amax_per_token / 6.0, 1.0)
+        local_scale = tl.where(shared_tile, tile_scale, token_scale)
+        if KV_GLOBAL_SCALE_PER_PAGE:
+            stored_scale = tl.minimum(local_scale * global_scale, 448.0)
+            v_stored_scale = tl.minimum(tile_scale * global_scale, 448.0)
+        else:
+            stored_scale = local_scale * global_scale
+            v_stored_scale = tile_scale * global_scale
 
-    token_scale_col = page_pos // HP_BLOCK
-    sf_offsets = _fp4_mla_swizzled_sf_offset(safe_all_d, token_scale_col, SF_PER_PAGE)
-    v_sf_base = tl.cast(local_layer, tl.int64) * tl.cast(
-        vsf_s0, tl.int64
-    ) + physical_page * tl.cast(vsf_s1, tl.int64)
-    tl.store(
-        v_sf_ptr + v_sf_base + sf_offsets.to(tl.int64),
-        v_stored_scale,
-        mask=mask_all_d & (all_d < V_HEAD_D),
-    )
+        low = _fp4_e2m1_quantize(even_values / local_scale[:, None])
+        high = _fp4_e2m1_quantize(odd_values / local_scale[:, None])
+        packed = low | (high << 4)
+
+        packed_cols = dim_block * (FP4_BLOCK // 2) + byte_offsets
+        page_positions = page_pos + token_offsets
+        kv_base = physical_page * kv_s0
+        tl.store(
+            kv_cache_ptr + kv_base + page_positions[:, None] * kv_s2 + packed_cols[None, :] * kv_s4,
+            packed,
+            mask=valid_tokens[:, None] & mask_even_d[None, :],
+        )
+
+        k_sf_offsets = _fp4_mla_swizzled_sf_offset(page_positions, dim_block, SF_PER_TOKEN)
+        tl.store(
+            sf_cache_ptr + physical_page * sf_s0 + k_sf_offsets,
+            stored_scale,
+            mask=valid_tokens,
+        )
+
+        token_scale_col = page_pos // HP_BLOCK
+        sf_offsets = _fp4_mla_swizzled_sf_offset(safe_all_d, token_scale_col, SF_PER_PAGE)
+        v_sf_base = tl.cast(local_layer, tl.int64) * tl.cast(
+            vsf_s0, tl.int64
+        ) + physical_page * tl.cast(vsf_s1, tl.int64)
+        tl.store(
+            v_sf_ptr + v_sf_base + sf_offsets.to(tl.int64),
+            v_stored_scale,
+            mask=mask_all_d & (all_d < V_HEAD_D),
+        )
+
+        if FUSE_ROPE_CACHE_STORE:
+            hp_store_mask = valid_tokens[:, None] & from_latent[:, None]
+            hp_store_base = (
+                hp_pool_ptr
+                + seq_slot * pool_s0
+                + local_layer * pool_s1
+                + hp_slots[:, None] * HEAD_D
+            )
+            tl.store(
+                hp_store_base + safe_even_d[None, :],
+                even_values,
+                mask=hp_store_mask & mask_even_d[None, :],
+            )
+            tl.store(
+                hp_store_base + safe_odd_d[None, :],
+                odd_values,
+                mask=hp_store_mask & mask_odd_d[None, :],
+            )
+            if tile_iter + 1 < MAX_GEN_TILES:
+                # The next tile can wrap onto HP slots read by this tile.
+                # Keep each dimension block's read-before-overwrite order.
+                tl.debug_barrier()
 
 
 @triton.jit

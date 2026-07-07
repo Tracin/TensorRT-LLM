@@ -405,16 +405,22 @@ class Fp4MlaFmha(PhasedFmha):
         qk_rope_head_dim = attn.qk_rope_head_dim or 0
         fused_head_dim = kv_lora_rank + qk_rope_head_dim
 
-        scatter_fp4_mla_kv_cache(
-            meta,
-            fwd.latent_cache,
-            attn.layer_idx,
-            token_offset=getattr(meta, "num_ctx_tokens", 0),
-            phase="generation",
-            local_layer=local_layer,
-            v_head_dim=kv_lora_rank,
-        )
-        update_hp_kv_for_fp4_mla(meta, fwd.latent_cache, local_layer, phase="generation")
+        cache_scattered = bool(getattr(meta, "_fp4_mla_generation_cache_scattered", False))
+        if cache_scattered:
+            meta._fp4_mla_generation_cache_scattered = False
+            hp_pool_updated = True
+        else:
+            hp_pool_updated = scatter_fp4_mla_kv_cache(
+                meta,
+                fwd.latent_cache,
+                attn.layer_idx,
+                token_offset=getattr(meta, "num_ctx_tokens", 0),
+                phase="generation",
+                local_layer=local_layer,
+                v_head_dim=kv_lora_rank,
+            )
+        if not hp_pool_updated:
+            update_hp_kv_for_fp4_mla(meta, fwd.latent_cache, local_layer, phase="generation")
 
         query = params.qkv_input.view(params.num_tokens, attn.num_heads, fused_head_dim)
         output = params.context_buf.view(params.num_tokens, attn.num_heads, kv_lora_rank)

@@ -38,7 +38,9 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 from ..utils import (compute_swizzled_sf_shape, get_global_attrs,
                      get_model_extra_attrs)
 from .fp4_mla import (FP4_MLA_KV_GLOBAL_SCALE, HP_BLOCK_SIZE,
-                      apply_fp4_mla_rope_qk, get_fp4_mla_hp_block_size)
+                      apply_fp4_mla_rope_qk,
+                      fp4_mla_dynamic_global_scale_enabled,
+                      get_fp4_mla_hp_block_size, scatter_fp4_mla_kv_cache)
 from .interface import (AttentionBackend, AttentionForwardArgs,
                         AttentionInputType, AttentionMask, AttentionMetadata,
                         KVCacheParams, MLAParams, PositionalEmbeddingParams,
@@ -174,6 +176,14 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     fp4_mla_generation_lengths_num_tokens: int = field(init=False, default=-1)
     fp4_mla_generation_lengths_num_seqs: int = field(init=False, default=-1)
     fp4_mla_generation_lengths_num_contexts: int = field(init=False, default=-1)
+    _fp4_mla_generation_lengths_capture_recorded: bool = field(init=False,
+                                                               default=False,
+                                                               repr=False)
+    _fp4_mla_generation_cache_scattered: bool = field(init=False,
+                                                      default=False,
+                                                      repr=False)
+    fp4_mla_consecutive_page_pair_prefix_tiles: int = field(init=False,
+                                                            default=0)
     _paged_kv_indptr: Optional[torch.Tensor] = None
     paged_kv_indptr_decode: Optional[torch.Tensor] = None
     _paged_kv_indices: Optional[torch.Tensor] = None
@@ -2289,7 +2299,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         latent_cache: torch.Tensor,
         metadata: TrtllmAttentionMetadata,
     ) -> None:
-        """Apply the MLA generation RoPE step without appending the FP4 KV cache."""
+        """Apply generation RoPE and update the static-scale FP4 cache."""
         assert self.kv_lora_rank is not None
         assert self.qk_rope_head_dim is not None
 
@@ -2311,6 +2321,33 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         positions = metadata.positions[token_offset:token_offset + num_tokens]
 
         k_pe = latent_cache[..., self.kv_lora_rank:]
+        metadata._fp4_mla_generation_cache_scattered = False
+        fuse_rope_cache_store = (not fp4_mla_dynamic_global_scale_enabled()
+                                 and self.rotary_cos_sin is not None
+                                 and q_pe.dtype == torch.bfloat16
+                                 and fused_q.dtype == torch.bfloat16
+                                 and latent_cache.dtype == torch.bfloat16
+                                 and self.rotary_cos_sin.dtype == torch.float32)
+        if fuse_rope_cache_store:
+            hp_pool_updated = scatter_fp4_mla_kv_cache(
+                metadata,
+                latent_cache,
+                self.layer_idx,
+                token_offset=token_offset,
+                phase="generation",
+                local_layer=self.get_local_layer_idx(metadata),
+                v_head_dim=self.kv_lora_rank,
+                rotary_cos_sin=self.rotary_cos_sin,
+                q_pe=q_pe,
+                q_rope_out=fused_q[..., self.kv_lora_rank:],
+            )
+            if not hp_pool_updated:
+                raise RuntimeError(
+                    "Fused FP4 MLA RoPE/cache scatter did not update the HP pool."
+                )
+            metadata._fp4_mla_generation_cache_scattered = True
+            return
+
         apply_fp4_mla_rope_qk(
             q_pe,
             k_pe,

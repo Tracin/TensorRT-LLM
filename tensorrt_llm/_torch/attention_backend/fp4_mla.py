@@ -21,10 +21,10 @@ import triton.language as tl
 from .fp4_mla_kernels import (
     _fp4_mla_context_page_amax_kernel,
     _fp4_mla_context_page_scale_kernel,
+    _fp4_mla_generation_fused_qk_rope_cache_update_kernel,
     _fp4_mla_generation_page_amax_kernel,
     _fp4_mla_generation_page_scale_kernel,
     _fp4_mla_v_scale_store_context_tokens_kernel,
-    _fp4_mla_v_scale_store_generation_tiles_kernel,
     _hp_kv_restore_rejected_from_pool_kernel,
     _hp_kv_restore_rejected_from_values_kernel,
     _hp_kv_store_context_kernel,
@@ -845,6 +845,7 @@ def _scatter_fp4_mla_kv_cache_2d_generation(
     v_sf: torch.Tensor,
     global_scale: torch.Tensor,
     *,
+    token_offset: int,
     local_layer: int,
     v_head_dim: int,
     head_dim: int,
@@ -852,7 +853,11 @@ def _scatter_fp4_mla_kv_cache_2d_generation(
     num_dim_blocks: int,
     sf_per_token: int,
     sf_per_page: int,
-) -> None:
+    rotary_cos_sin: Optional[torch.Tensor],
+    q_pe: Optional[torch.Tensor],
+    q_rope_out: Optional[torch.Tensor],
+    fuse_rope_cache_store: bool,
+) -> Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
     num_contexts = metadata.num_contexts
     num_seqs = metadata.num_seqs
     num_gen = num_seqs - num_contexts
@@ -889,6 +894,63 @@ def _scatter_fp4_mla_kv_cache_2d_generation(
     max_gen_len = num_tokens // num_gen
     page_ids = metadata.paged_kv_indices[metadata.num_context_blocks :]
     dynamic_global_scale = fp4_mla_dynamic_global_scale_enabled()
+    if fuse_rope_cache_store and dynamic_global_scale:
+        raise RuntimeError("Fused FP4 MLA Q/K RoPE and cache storage requires static KV scaling.")
+    rope_dim = head_dim - v_head_dim
+    block_q_heads = 4
+    num_q_heads = 0
+    q_head_blocks = 0
+    if fuse_rope_cache_store:
+        if latent_cache.dtype != torch.bfloat16:
+            raise TypeError(
+                "Fused FP4 MLA Q/K RoPE and cache storage requires BF16 latent KV, "
+                f"got {latent_cache.dtype}."
+            )
+        if rope_dim <= 0 or rope_dim % 2 != 0:
+            raise ValueError(
+                "Fused FP4 MLA K RoPE requires a positive even K tail, "
+                f"got head_dim={head_dim} v_head_dim={v_head_dim}."
+            )
+        if (
+            rotary_cos_sin is None
+            or rotary_cos_sin.device != latent_cache.device
+            or rotary_cos_sin.dtype != torch.float32
+            or rotary_cos_sin.numel() % (rope_dim * 2) != 0
+        ):
+            raise ValueError(
+                "Fused FP4 MLA K RoPE requires a same-device FP32 rotary "
+                f"table with rows of {rope_dim * 2} values."
+            )
+        if (
+            q_pe is None
+            or q_rope_out is None
+            or q_pe.dtype != torch.bfloat16
+            or q_rope_out.dtype != torch.bfloat16
+            or q_pe.device != latent_cache.device
+            or q_rope_out.device != latent_cache.device
+            or q_pe.ndim != 3
+            or q_rope_out.shape != q_pe.shape
+            or q_pe.shape[0] != num_tokens
+            or q_pe.shape[1] <= 0
+            or q_pe.shape[2] != rope_dim
+        ):
+            raise ValueError(
+                "Fused FP4 MLA Q RoPE requires same-device BF16 q_pe and "
+                f"q_rope_out tensors shaped [tokens, heads, {rope_dim}]."
+            )
+        num_q_heads = q_pe.shape[1]
+        q_head_blocks = _ceil_div(num_q_heads, block_q_heads)
+        _snapshot_hp_kv_for_mtp_generation(
+            metadata,
+            pool,
+            local_layer,
+            num_gen=num_gen,
+            num_gen_tokens=num_tokens,
+            max_gen_len=max_gen_len,
+            metadata_token_offset=token_offset,
+            head_dim=head_dim,
+            pool_head_dim=hp_head_dim,
+        )
     if dynamic_global_scale:
         global_scale = _prepare_dynamic_generation_kv_global_scales(
             metadata,
@@ -905,19 +967,25 @@ def _scatter_fp4_mla_kv_cache_2d_generation(
         max_gen_tiles = _ceil_div(max_gen_len + metadata.page_size - 1, FP4_BLOCK_SIZE)
     else:
         max_gen_tiles = _ceil_div(max_gen_len + FP4_BLOCK_SIZE - 1, FP4_BLOCK_SIZE)
-    _fp4_mla_v_scale_store_generation_tiles_kernel[
-        (
-            num_gen,
-            max(max_gen_tiles, 1),
-            num_dim_blocks,
-        )
-    ](
+    rotary_table = rotary_cos_sin if rotary_cos_sin is not None else global_scale
+    q_pe_input = q_pe if q_pe is not None else latent_cache
+    q_rope_output = q_rope_out if q_rope_out is not None else latent_cache
+    launch_grid = (
+        (num_gen, num_dim_blocks + max_gen_len * q_head_blocks)
+        if fuse_rope_cache_store
+        else (num_gen, max(max_gen_tiles, 1), num_dim_blocks)
+    )
+    _fp4_mla_generation_fused_qk_rope_cache_update_kernel[launch_grid](
         kv_cache,
         sf_cache,
         v_sf,
         pool,
         latent_cache,
         global_scale,
+        metadata.positions,
+        rotary_table,
+        q_pe_input,
+        q_rope_output,
         metadata.seq_slots[num_contexts:num_seqs],
         kv_lens_gen,
         gen_lens_gen,
@@ -941,6 +1009,14 @@ def _scatter_fp4_mla_kv_cache_2d_generation(
         v_sf.stride(0),
         v_sf.stride(1),
         global_scale.stride(0),
+        token_offset,
+        metadata.positions.shape[0],
+        q_pe_input.stride(0),
+        q_pe_input.stride(1) if q_pe_input.ndim > 1 else 0,
+        q_pe_input.stride(2) if q_pe_input.ndim > 2 else 0,
+        q_rope_output.stride(0),
+        q_rope_output.stride(1) if q_rope_output.ndim > 1 else 0,
+        q_rope_output.stride(2) if q_rope_output.ndim > 2 else 0,
         HEAD_D=hp_head_dim,
         V_HEAD_D=v_head_dim,
         HP_BLOCK=FP4_BLOCK_SIZE,
@@ -950,6 +1026,14 @@ def _scatter_fp4_mla_kv_cache_2d_generation(
         SF_PER_PAGE=sf_per_page,
         REWRITE_PAGE=dynamic_global_scale,
         KV_GLOBAL_SCALE_PER_PAGE=dynamic_global_scale,
+        FUSE_ROPE_CACHE_STORE=fuse_rope_cache_store,
+        MAX_GEN_TILES=max(max_gen_tiles, 1) if fuse_rope_cache_store else 1,
+        ROPE_DIM=rope_dim if fuse_rope_cache_store else 2,
+        ROPE_PAIR_BLOCK=(triton.next_power_of_2(rope_dim // 2) if fuse_rope_cache_store else 1),
+        NUM_DIM_BLOCKS=num_dim_blocks,
+        NUM_Q_HEADS=num_q_heads,
+        Q_HEAD_BLOCKS=max(q_head_blocks, 1),
+        BLOCK_Q_HEADS=block_q_heads,
     )
 
 
@@ -965,7 +1049,10 @@ def scatter_fp4_mla_kv_cache(
     phase: Optional[_HPUpdatePhase] = None,
     local_layer: Optional[int] = None,
     v_head_dim: Optional[int] = None,
-) -> None:
+    rotary_cos_sin: Optional[torch.Tensor] = None,
+    q_pe: Optional[torch.Tensor] = None,
+    q_rope_out: Optional[torch.Tensor] = None,
+) -> bool:
     """Quantize MLA latent tokens and scatter them into the paged FP4 cache.
 
     Contract: this helper scatters exactly ``latent_cache.shape[0]`` tokens,
@@ -983,10 +1070,12 @@ def scatter_fp4_mla_kv_cache(
     K's token-major scale layout and V's dim-major scale layout. Tail K-only
     dimensions use K's per-token 1D scales. Generation scatter rewrites each
     touched 16-token tile by reading old tokens from the HP pool and new tokens
-    from ``latent_cache``; callers then update the HP pool after scatter.
+    from ``latent_cache``. The static-scale generation specialization can also
+    rotate Q and new K tails while updating the HP pool; the return value reports
+    whether that fused RoPE/cache update ran.
     """
     if latent_cache is None or latent_cache.numel() == 0:
-        return
+        return False
 
     _validate_fp4_mla_dynamic_scale_backend()
 
@@ -1038,6 +1127,17 @@ def scatter_fp4_mla_kv_cache(
     num_dim_blocks = triton.cdiv(head_dim, FP4_BLOCK_SIZE)
     sf_per_page = metadata.page_size // FP4_BLOCK_SIZE
 
+    rope_cache_args = (rotary_cos_sin, q_pe, q_rope_out)
+    if any(arg is not None for arg in rope_cache_args) and not all(
+        arg is not None for arg in rope_cache_args
+    ):
+        raise ValueError(
+            "FP4 MLA fused RoPE/cache storage requires rotary_cos_sin, q_pe, "
+            "and q_rope_out together."
+        )
+    fuse_rope_cache_store = phase == "generation" and all(
+        arg is not None for arg in rope_cache_args
+    )
     if phase == "context":
         _scatter_fp4_mla_kv_cache_2d_context(
             metadata,
@@ -1064,6 +1164,7 @@ def scatter_fp4_mla_kv_cache(
             sf_cache,
             v_sf,
             global_scale,
+            token_offset=token_offset,
             local_layer=local_layer,
             v_head_dim=v_head_dim,
             head_dim=head_dim,
@@ -1071,6 +1172,10 @@ def scatter_fp4_mla_kv_cache(
             num_dim_blocks=num_dim_blocks,
             sf_per_token=sf_per_token,
             sf_per_page=sf_per_page,
+            rotary_cos_sin=rotary_cos_sin,
+            q_pe=q_pe,
+            q_rope_out=q_rope_out,
+            fuse_rope_cache_store=fuse_rope_cache_store,
         )
         num_gen_blocks = metadata.num_generation_blocks
         v_pack_page_ids = metadata.paged_kv_indices[
@@ -1097,6 +1202,7 @@ def scatter_fp4_mla_kv_cache(
         local_layer=local_layer,
         v_sf=v_sf[local_layer],
     )
+    return fuse_rope_cache_store
 
 
 def _validate_fp4_mla_cache_shape(page_size: int, head_dim: int) -> None:

@@ -835,6 +835,152 @@ def test_fp4_mla_hp_overlay_generation_phase():
 
 
 @pytest.mark.skipif(_is_pre_blackwell(), reason="requires Blackwell FP4 support")
+def test_fp4_mla_fused_qk_rope_hp_store_crosses_tile_boundary(monkeypatch):
+    monkeypatch.setenv(FP4_MLA_ATTENTION_BACKEND_ENV, "triton")
+    monkeypatch.setenv(FP4_MLA_DYNAMIC_GLOBAL_SCALE_ENV, "0")
+    torch.manual_seed(17)
+    device = torch.device("cuda")
+    kv_lora_rank = 512
+    rope_dim = 64
+    head_dim = kv_lora_rank + rope_dim
+    page_size = FP4_MLA_TOKENS_PER_BLOCK
+    context_tokens = HP_BLOCK_SIZE - 2
+    generation_tokens = 4
+    num_heads = 7
+    total_tokens = context_tokens + generation_tokens
+    max_positions = page_size * 2
+    context_latent = torch.randn(context_tokens, head_dim, dtype=torch.bfloat16, device=device)
+    generation_latent = torch.randn(
+        generation_tokens, head_dim, dtype=torch.bfloat16, device=device
+    )
+    q_pe = torch.randn(
+        generation_tokens,
+        num_heads,
+        rope_dim,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    rotary_cos_sin = torch.randn(max_positions, rope_dim, 2, dtype=torch.float32, device=device)
+    positions = torch.arange(context_tokens, total_tokens, dtype=torch.int32, device=device)
+    rotated_generation = generation_latent.clone()
+    rotated_generation[:, kv_lora_rank:] = apply_fp4_mla_rope(
+        generation_latent[:, kv_lora_rank:].unsqueeze(1),
+        positions,
+        rotary_cos_sin,
+        max_positions,
+        rope_dim,
+    ).squeeze(1)
+    expected_q = apply_fp4_mla_rope(
+        q_pe,
+        positions,
+        rotary_cos_sin,
+        max_positions,
+        rope_dim,
+    )
+
+    def make_case():
+        manager = KVCacheManager(
+            KvCacheConfig(max_tokens=page_size, enable_block_reuse=False),
+            _CacheType.SELFKONLY,
+            num_layers=1,
+            num_kv_heads=1,
+            head_dim=head_dim,
+            tokens_per_block=page_size,
+            max_seq_len=page_size,
+            max_batch_size=1,
+            mapping=Mapping(world_size=1, tp_size=1, rank=0),
+            dtype=_DataType.NVFP4,
+        )
+        manager.add_dummy_requests([0], [total_tokens])
+        manager.get_buffers(0).view(torch.uint8).zero_()
+        manager.get_block_scale_buffers(0).zero_()
+        metadata = _build_metadata(
+            manager,
+            num_tokens=total_tokens,
+            page_size=page_size,
+            num_layers=1,
+        )
+        metadata.fp4_mla_v_scale_pool.zero_()
+        metadata.num_contexts = 0
+        metadata.kv_lens_cuda_runtime = torch.tensor(
+            [total_tokens], dtype=torch.int32, device=device
+        )
+        metadata.prompt_lens_cuda_runtime = torch.tensor(
+            [generation_tokens], dtype=torch.int32, device=device
+        )
+        metadata.prompt_lens_cpu_runtime = torch.tensor([generation_tokens], dtype=torch.int32)
+        metadata.positions = positions.clone()
+        metadata.batch_indices = torch.zeros(generation_tokens, dtype=torch.int32, device=device)
+        pool_view = metadata.high_precision_kv_pool[0, 0, 0].view(HP_BLOCK_SIZE, head_dim)
+        pool_view[:context_tokens].copy_(context_latent)
+        return manager, metadata
+
+    reference_manager, reference_metadata = make_case()
+    fused_manager, fused_metadata = make_case()
+    try:
+        scatter_fp4_mla_kv_cache(
+            reference_metadata,
+            rotated_generation,
+            layer_idx=0,
+            token_offset=0,
+            phase="generation",
+            local_layer=0,
+            v_head_dim=kv_lora_rank,
+        )
+        update_hp_kv_for_fp4_mla(
+            reference_metadata,
+            rotated_generation,
+            local_layer=0,
+            phase="generation",
+        )
+
+        fused_q = torch.empty_like(q_pe)
+        hp_pool_updated = scatter_fp4_mla_kv_cache(
+            fused_metadata,
+            generation_latent,
+            layer_idx=0,
+            token_offset=0,
+            phase="generation",
+            local_layer=0,
+            v_head_dim=kv_lora_rank,
+            rotary_cos_sin=rotary_cos_sin,
+            q_pe=q_pe,
+            q_rope_out=fused_q,
+        )
+        assert hp_pool_updated
+        torch.cuda.synchronize()
+        torch.testing.assert_close(fused_q, expected_q, atol=0, rtol=0)
+
+        torch.testing.assert_close(
+            fused_manager.get_buffers(0).view(torch.uint8),
+            reference_manager.get_buffers(0).view(torch.uint8),
+            atol=0,
+            rtol=0,
+        )
+        torch.testing.assert_close(
+            fused_manager.get_block_scale_buffers(0).view(torch.uint8),
+            reference_manager.get_block_scale_buffers(0).view(torch.uint8),
+            atol=0,
+            rtol=0,
+        )
+        torch.testing.assert_close(
+            fused_metadata.fp4_mla_v_scale_pool.view(torch.uint8),
+            reference_metadata.fp4_mla_v_scale_pool.view(torch.uint8),
+            atol=0,
+            rtol=0,
+        )
+        torch.testing.assert_close(
+            fused_metadata.high_precision_kv_pool,
+            reference_metadata.high_precision_kv_pool,
+            atol=0,
+            rtol=0,
+        )
+    finally:
+        reference_manager.shutdown()
+        fused_manager.shutdown()
+
+
+@pytest.mark.skipif(_is_pre_blackwell(), reason="requires Blackwell FP4 support")
 def test_fp4_mla_dynamic_scale_mtp_requantizes_touched_pages(monkeypatch):
     monkeypatch.setenv(FP4_MLA_ATTENTION_BACKEND_ENV, "triton")
     monkeypatch.setenv(FP4_MLA_DYNAMIC_GLOBAL_SCALE_ENV, "1")
