@@ -637,6 +637,23 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             self.prompt_lens_cpu_runtime = self.seq_lens_kv[:num_seqs]
         self._update_fp4_mla_append_metadata()
 
+    def restore_from_spec_dec(self) -> None:
+        # The spec-dec draft loop pointed the FP4 MLA length aliases at the
+        # temporary _seq_lens_cuda clone made by prepare_for_spec_dec.  Rebind
+        # them to the restored stable buffers; otherwise the next forward's
+        # captured ops (CUDA graph) bake pointers to the clone, which is freed
+        # after capture, and every replay reads freed memory (garbage
+        # positions/kv lens -> corrupted KV writes and illegal memory access
+        # in the RoPE table lookup).
+        super().restore_from_spec_dec()
+        if self.high_precision_kv_pool is None:
+            return
+        num_seqs = self.num_seqs
+        self.kv_lens_cuda_runtime = self.kv_lens_cuda[:num_seqs]
+        self.prompt_lens_cuda_runtime = self.seq_lens_kv_cuda[:num_seqs]
+        if not torch.cuda.is_current_stream_capturing():
+            self.prompt_lens_cpu_runtime = self.seq_lens_kv[:num_seqs]
+
     def update_helix_param(
         self,
         helix_position_offsets: List[int],
@@ -866,8 +883,14 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         kv_start = torch.repeat_interleave(kv_token_starts,
                                            seq_lens,
                                            output_size=self.num_tokens)
-        append_lens = self.prompt_lens_cuda_runtime[:num_seqs]
-        cached_token_lens = self.kv_lens_cuda_runtime[:num_seqs] - append_lens
+        # Read the canonical tensors, not the *_runtime aliases: the aliases
+        # can be left pointing at a freed spec-dec clone from a previous
+        # forward, and a CUDA graph capture would bake that dangling pointer
+        # into the graph.  seq_lens_kv_cuda resolves to the stable buffer in
+        # the main forward and to the live draft-loop clone between MTP
+        # sub-steps, which matches the append semantics in both phases.
+        append_lens = self.seq_lens_kv_cuda[:num_seqs]
+        cached_token_lens = self.kv_lens_cuda[:num_seqs] - append_lens
         cached_start = torch.repeat_interleave(cached_token_lens,
                                                seq_lens,
                                                output_size=self.num_tokens)
