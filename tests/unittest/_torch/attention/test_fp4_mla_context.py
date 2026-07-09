@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """FP4 MLA context FMHA tests."""
 
+from types import SimpleNamespace
+
 import torch
 
 import tensorrt_llm._torch.attention_backend.fmha.fp4_mla as fp4_mla_fmha
@@ -94,3 +96,36 @@ def test_fp4_mla_fp8_context_scratch_block_tables():
     torch.testing.assert_close(block_ids, expected)
     torch.testing.assert_close(block_offsets[0, :, 0], expected)
     torch.testing.assert_close(block_offsets[0, :, 1], expected)
+
+
+def test_fp4_mla_fp8_context_metadata_uses_fresh_lengths():
+    prompt_lens_cuda = torch.tensor([5, 7, 3], dtype=torch.int32)
+    prompt_lens_cpu = torch.tensor([5, 7, 3], dtype=torch.int32)
+    positions = torch.tensor(
+        [100, 101, 102, 103, 104, 200, 201, 202, 203, 204, 205, 206, 0],
+        dtype=torch.int32,
+    )
+    metadata = SimpleNamespace(
+        num_contexts=2,
+        num_ctx_tokens=12,
+        prompt_lens_cuda_runtime=prompt_lens_cuda,
+        prompt_lens_cpu_runtime=prompt_lens_cpu,
+        kv_lens_cuda_runtime=torch.tensor([105, 207, 303], dtype=torch.int32),
+        kv_lens_runtime=torch.tensor([100, 200, 300], dtype=torch.int32),
+        host_total_kv_lens=torch.tensor([312, 303], dtype=torch.int32),
+        positions=positions,
+    )
+    scratch = SimpleNamespace(
+        block_offsets=torch.empty(0),
+        host_pool_pointers=torch.empty(0),
+        host_pool_mapping=torch.empty(0),
+        block_ids_per_seq=torch.empty(0),
+        host_total_kv_lens=torch.tensor([12, 0], dtype=torch.int32),
+    )
+
+    proxy = fp4_mla_fmha._Fp8MlaContextMetadataProxy(metadata, scratch)
+
+    torch.testing.assert_close(proxy.kv_lens_cuda_runtime, prompt_lens_cuda[:2])
+    torch.testing.assert_close(proxy.kv_lens_runtime, prompt_lens_cpu[:2])
+    torch.testing.assert_close(proxy.host_total_kv_lens, torch.tensor([12, 0], dtype=torch.int32))
+    torch.testing.assert_close(proxy.helix_position_offsets, positions[:12])

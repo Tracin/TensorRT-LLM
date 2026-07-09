@@ -153,6 +153,7 @@ class _Fp8MlaContextScratch:
     block_ids_per_seq: torch.Tensor
     host_pool_pointers: torch.Tensor
     host_pool_mapping: torch.Tensor
+    host_total_kv_lens: torch.Tensor
     max_num_sequences: int
     max_blocks_per_seq: int
     capacity_blocks: int
@@ -217,12 +218,19 @@ class _Fp8MlaContextScratch:
             device="cpu",
             pin_memory=prefer_pinned(),
         )
+        host_total_kv_lens = torch.zeros(
+            2,
+            dtype=meta.host_total_kv_lens.dtype,
+            device="cpu",
+            pin_memory=prefer_pinned(),
+        )
         return cls(
             pool=pool,
             block_offsets=block_offsets,
             block_ids_per_seq=block_ids_per_seq,
             host_pool_pointers=host_pool_pointers,
             host_pool_mapping=host_pool_mapping,
+            host_total_kv_lens=host_total_kv_lens,
             max_num_sequences=max_num_sequences,
             max_blocks_per_seq=max_blocks_per_seq,
             capacity_blocks=capacity_blocks,
@@ -254,6 +262,8 @@ class _Fp8MlaContextScratch:
         context_lengths = tuple(
             int(length) for length in meta.prompt_lens_cpu_runtime[: meta.num_contexts].tolist()
         )
+        self.host_total_kv_lens[0] = sum(context_lengths)
+        self.host_total_kv_lens[1] = 0
         if context_lengths == self.mapping_signature:
             return
 
@@ -300,6 +310,16 @@ class _Fp8MlaContextMetadataProxy:
         self.host_kv_cache_pool_pointers = scratch.host_pool_pointers
         self.host_kv_cache_pool_mapping = scratch.host_pool_mapping
         self.block_ids_per_seq = scratch.block_ids_per_seq
+        # The disposable cache represents only this context invocation. Expose
+        # exact context-only lengths so cached prefixes, trailing generation
+        # metadata, and stale totals cannot extend FP8 K/V quantization.
+        self.kv_lens_cuda_runtime = meta.prompt_lens_cuda_runtime[: meta.num_contexts]
+        self.kv_lens_runtime = meta.prompt_lens_cpu_runtime[: meta.num_contexts]
+        self.host_total_kv_lens = scratch.host_total_kv_lens
+        # Scratch lengths intentionally start from zero. Preserve the actual
+        # absolute positions for Q/K RoPE through the native kernel's explicit
+        # per-token position-offset input.
+        self.helix_position_offsets = meta.positions[: meta.num_ctx_tokens]
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._meta, name)
