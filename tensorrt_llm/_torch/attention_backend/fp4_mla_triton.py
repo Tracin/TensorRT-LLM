@@ -265,6 +265,69 @@ def _fp4_mla_attention_v_repack_pages_kernel(
     out_desc.store([row_base.to(tl.int32), 0], v_vals)
 
 
+@triton.jit
+def _fp4_mla_attention_v_repack_pages_dyn_kernel(
+    v_packed_ptr,
+    kv_cache_ptr,
+    page_ids_ptr,
+    num_valid_pages_ptr,
+    num_pages,
+    kv_s0,
+    kv_s2,
+    kv_s4,
+    V_HEAD_D: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    BLOCK_V: tl.constexpr,
+    occupancy: tl.constexpr = 1,
+):
+    """Grid-strided variant of the pages repack for CUDA graph replay.
+
+    The page count varies per replay while launch grids are frozen at
+    capture, so the grid covers the page-id buffer capacity and each
+    program strides over the live count read from device memory.
+    """
+    prog = tl.program_id(0)
+    num_progs = tl.num_programs(0)
+    dim_block = tl.program_id(1)
+    num_valid = tl.load(num_valid_pages_ptr)
+
+    tl.assume(kv_s0 % 8 == 0)
+    tl.assume(kv_s2 % 8 == 0)
+    tl.assume(kv_s4 == 1)
+    v_desc = tl.make_tensor_descriptor(
+        kv_cache_ptr,
+        shape=[num_pages, PAGE_SIZE, V_HEAD_D // 2],
+        strides=[kv_s0, kv_s2, kv_s4],
+        block_shape=[1, PAGE_SIZE, BLOCK_V // 2],
+    )
+    out_desc = tl.make_tensor_descriptor(
+        v_packed_ptr,
+        shape=[num_pages * (V_HEAD_D // BLOCK_V) * BLOCK_V, PAGE_SIZE // 2],
+        strides=[PAGE_SIZE // 2, 1],
+        block_shape=[BLOCK_V, PAGE_SIZE // 2],
+    )
+    for page_list_idx in range(prog, num_valid, num_progs):
+        page_idx = tl.load(page_ids_ptr + page_list_idx).to(tl.int64)
+        v_tile = v_desc.load(
+            [
+                page_idx.to(tl.int32),
+                0,
+                (dim_block * (BLOCK_V // 2)).to(tl.int32),
+            ]
+        )
+        v_tile = tl.reshape(v_tile, (PAGE_SIZE, BLOCK_V // 2))
+        v_pairs = tl.reshape(v_tile.T, (BLOCK_V // 2, PAGE_SIZE // 2, 2))
+        even_packed, odd_packed = tl.split(v_pairs)
+        low_vals = _fp4_pack_low_nibbles(even_packed, odd_packed)
+        high_vals = _fp4_pack_high_nibbles(even_packed, odd_packed)
+        v_vals = tl.reshape(
+            tl.join(low_vals, high_vals).permute(0, 2, 1),
+            (BLOCK_V, PAGE_SIZE // 2),
+        )
+        row_base = (page_idx * (V_HEAD_D // BLOCK_V) + dim_block) * BLOCK_V
+        out_desc.store([row_base.to(tl.int32), 0], v_vals)
+
+
 def fp4_mla_repack_v_cache(
     v_packed: Any,
     kv_cache: Any,
@@ -275,6 +338,7 @@ def fp4_mla_repack_v_cache(
     block_v: int = 128,
     kernel_occupancy: int = 8,
     kernel_num_stages: int = 1,
+    num_valid_pages: Optional[Any] = None,
 ) -> None:
     """Populate the public-Triton V-packed auxiliary cache."""
     if v_head_dim % block_v != 0:
@@ -307,6 +371,27 @@ def fp4_mla_repack_v_cache(
         return
 
     if page_ids.numel() == 0:
+        return
+    if num_valid_pages is not None:
+        # CUDA-graph path: the live page count varies per replay while launch
+        # grids and scalar args are frozen at capture. Launch a
+        # capacity-independent program count and stride over the device-side
+        # count so every replay repacks exactly the current batch's pages.
+        num_programs = min(int(page_ids.numel()), 2048)
+        _fp4_mla_attention_v_repack_pages_dyn_kernel[(num_programs, num_dim_blocks)](
+            v_packed,
+            kv_cache,
+            page_ids,
+            num_valid_pages,
+            num_pages,
+            kv_cache.stride(0),
+            kv_cache.stride(2),
+            kv_cache.stride(4),
+            V_HEAD_D=v_head_dim,
+            PAGE_SIZE=page_size,
+            BLOCK_V=block_v,
+            **launch_meta,
+        )
         return
     _fp4_mla_attention_v_repack_pages_kernel[(page_ids.numel(), num_dim_blocks)](
         v_packed,

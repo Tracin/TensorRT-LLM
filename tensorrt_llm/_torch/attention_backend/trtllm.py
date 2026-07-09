@@ -176,6 +176,10 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     fp4_mla_generation_lengths_num_tokens: int = field(init=False, default=-1)
     fp4_mla_generation_lengths_num_seqs: int = field(init=False, default=-1)
     fp4_mla_generation_lengths_num_contexts: int = field(init=False, default=-1)
+    # Trash row (one past the last real seq slot) absorbing HP-pool writes
+    # from rows that never received a SeqSlotManager slot (CUDA-graph
+    # padding dummies). Set where the HP pool is allocated.
+    fp4_mla_hp_trash_seq_slot: int = field(init=False, default=0)
     _fp4_mla_generation_lengths_capture_recorded: bool = field(init=False,
                                                                default=False,
                                                                repr=False)
@@ -506,21 +510,48 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             head_dim = self.kv_cache_manager.head_dim
             kv_factor = self.kv_cache_manager.kv_factor
             hp_block_size = self.fp4_mla_hp_block_size
-            self.high_precision_kv_pool = self.get_empty(
-                buffers,
-                [
-                    self.max_num_sequences, num_local_layers, kv_factor,
-                    hp_block_size * head_dim
-                ],
-                cache_name="high_precision_kv_pool",
-                dtype=torch.bfloat16,
-                capture_graph=capture_graph,
-            )
+            # CUDA-graph padding dummies never receive a SeqSlotManager slot.
+            # HP-pool scatters run inside captured graphs for every row, so
+            # those rows must write to a dedicated trash row instead of
+            # aliasing slot 0 (which belongs to a live request). Both pools
+            # carry one extra row for this.
+            self.fp4_mla_hp_trash_seq_slot = self.max_num_sequences
+            num_hp_pool_slots = self.max_num_sequences + 1
+            hp_pool_shape = [
+                num_hp_pool_slots, num_local_layers, kv_factor,
+                hp_block_size * head_dim
+            ]
+            # Unlike every other buffer here (repopulated each step), the HP
+            # pool is persistent per-slot state: it carries each sequence's
+            # most recent latents from one forward to the next. Prefill always
+            # runs eagerly while decode may replay CUDA graphs, so the eager
+            # metadata and every per-graph metadata must alias one tensor.
+            # Per-instance allocation (private zeros for eager, shared
+            # cuda-graph buffer cache for graphs) splits that state, and graph
+            # decode then requantizes prompt-tail tiles from rows prefill
+            # never wrote. Anchor a single allocation on the KV cache manager,
+            # which is the one object shared by all metadata instances of
+            # this engine.
+            hp_pool = getattr(self.kv_cache_manager, '_fp4_mla_hp_kv_pool',
+                              None)
+            if hp_pool is None or list(hp_pool.shape) != hp_pool_shape:
+                hp_pool = torch.zeros(hp_pool_shape,
+                                      device='cuda',
+                                      dtype=torch.bfloat16)
+                self.kv_cache_manager._fp4_mla_hp_kv_pool = hp_pool
+                logger.info(f"Allocated high-precision BF16 KV pool: shape="
+                            f"{hp_pool_shape}, "
+                            f"size={hp_pool.nbytes / (1 << 20):.1f} MB")
+            self.high_precision_kv_pool = hp_pool
+            # The trash row is read back by per-page amax kernels for dummy
+            # rows; zero it so uninitialized bf16 patterns (NaN/inf) never
+            # feed scale computations.
+            self.high_precision_kv_pool[self.fp4_mla_hp_trash_seq_slot].zero_()
             if capture_graph:
                 self.fp4_mla_hp_snapshot_pool = self.get_empty(
                     buffers,
                     [
-                        self.max_num_sequences, num_local_layers, kv_factor,
+                        num_hp_pool_slots, num_local_layers, kv_factor,
                         hp_block_size * head_dim
                     ],
                     cache_name="fp4_mla_hp_snapshot_pool",
@@ -588,10 +619,6 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             self._fp4_mla_global_scale.fill_(FP4_MLA_KV_GLOBAL_SCALE)
             self.fp4_mla_v_scale_pool = self.kv_cache_manager.get_mla_v_scale_pool(
             )
-            logger.info(
-                f"Allocated high-precision BF16 KV pool: shape="
-                f"{list(self.high_precision_kv_pool.shape)}, "
-                f"size={self.high_precision_kv_pool.nbytes / (1 << 20):.1f} MB")
 
         # Allocate static buffers for helix parallelism support.
         if self.enable_helix:

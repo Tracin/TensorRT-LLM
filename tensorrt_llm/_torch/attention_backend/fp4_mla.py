@@ -776,6 +776,38 @@ def _scatter_fp4_mla_kv_cache_2d_context(
     )
 
 
+def _fp4_mla_generation_page_ids(metadata: Any) -> torch.Tensor:
+    """Return the generation-segment view of the compact page-id table.
+
+    Captured kernels receive tensor *lengths* as frozen scalar launch args, so
+    under CUDA graphs the view must be capacity-bounded (constant across
+    replays) rather than sized to the current batch's logical block count —
+    otherwise replays whose flattened page offsets exceed the capture-time
+    count silently skip cache updates and mask pages out of attention. True
+    per-sequence bounds always come from device-side ``paged_kv_indptr_decode``
+    and ``kv_lens``, which are refreshed every replay.
+    """
+    start = metadata.num_context_blocks
+    buffer = getattr(metadata, "_paged_kv_indices", None)
+    if buffer is None:
+        # Test doubles expose only the logical page-id tensor.
+        buffer = metadata.paged_kv_indices
+    if getattr(metadata, "is_cuda_graph", False):
+        return buffer[start:]
+    return buffer[start : start + metadata.num_generation_blocks]
+
+
+def _fp4_mla_generation_num_blocks_device(metadata: Any) -> torch.Tensor:
+    """Device-side scalar view holding the live generation block count.
+
+    ``paged_kv_indptr_decode[num_gen]`` is the exclusive prefix-sum total of
+    generation-segment blocks and is refreshed on the host every step, so it
+    is safe to read inside captured kernels.
+    """
+    num_gen = metadata.num_seqs - metadata.num_contexts
+    return metadata.paged_kv_indptr_decode[num_gen : num_gen + 1]
+
+
 def _fp4_mla_uniform_generation_lengths(
     metadata: Any, num_gen_tokens: int, num_gen: int
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -892,7 +924,7 @@ def _scatter_fp4_mla_kv_cache_2d_generation(
         )
 
     max_gen_len = num_tokens // num_gen
-    page_ids = metadata.paged_kv_indices[metadata.num_context_blocks :]
+    page_ids = _fp4_mla_generation_page_ids(metadata)
     dynamic_global_scale = fp4_mla_dynamic_global_scale_enabled()
     if fuse_rope_cache_store and dynamic_global_scale:
         raise RuntimeError("Fused FP4 MLA Q/K RoPE and cache storage requires static KV scaling.")
@@ -1138,6 +1170,7 @@ def scatter_fp4_mla_kv_cache(
     fuse_rope_cache_store = phase == "generation" and all(
         arg is not None for arg in rope_cache_args
     )
+    v_pack_num_valid = None
     if phase == "context":
         _scatter_fp4_mla_kv_cache_2d_context(
             metadata,
@@ -1177,10 +1210,11 @@ def scatter_fp4_mla_kv_cache(
             q_rope_out=q_rope_out,
             fuse_rope_cache_store=fuse_rope_cache_store,
         )
-        num_gen_blocks = metadata.num_generation_blocks
-        v_pack_page_ids = metadata.paged_kv_indices[
-            metadata.num_context_blocks : metadata.num_context_blocks + num_gen_blocks
-        ]
+        v_pack_page_ids = _fp4_mla_generation_page_ids(metadata)
+        if getattr(metadata, "is_cuda_graph", False):
+            # Frozen launch grids cannot follow the per-replay page count;
+            # the repack kernels stride over this device-side count instead.
+            v_pack_num_valid = _fp4_mla_generation_num_blocks_device(metadata)
     _maybe_update_cutile_v_packed_cache(
         metadata,
         layer_idx,
@@ -1190,6 +1224,7 @@ def scatter_fp4_mla_kv_cache(
         page_size=metadata.page_size,
         local_layer=local_layer,
         v_sf=v_sf[local_layer],
+        num_valid_pages=v_pack_num_valid,
     )
     _maybe_update_triton_v_packed_cache(
         metadata,
@@ -1201,6 +1236,7 @@ def scatter_fp4_mla_kv_cache(
         page_size=metadata.page_size,
         local_layer=local_layer,
         v_sf=v_sf[local_layer],
+        num_valid_pages=v_pack_num_valid,
     )
     return fuse_rope_cache_store
 
@@ -1475,8 +1511,16 @@ def _maybe_update_cutile_v_packed_cache(
     page_size: int,
     local_layer: Optional[int] = None,
     v_sf: Optional[torch.Tensor] = None,
+    num_valid_pages: Optional[torch.Tensor] = None,
 ) -> None:
     if not _cutile_persistent_v_pack_enabled():
+        return
+    if num_valid_pages is not None:
+        # CUDA-graph path: the cutile repack has no grid-strided variant yet,
+        # and a launch grid frozen at capture would repack only a prefix of
+        # each replay's pages, leaving stale packed V for the rest. Skip the
+        # update (and thus never mark the cache valid), so attention falls
+        # back to reading V nibbles directly from the paged cache.
         return
     num_gen_seqs = getattr(metadata, "num_seqs", 0) - getattr(metadata, "num_contexts", 0)
     block_v = _select_cutile_block_v(num_gen_seqs)
@@ -1741,6 +1785,7 @@ def _update_triton_v_packed_cache(
     block_v: int,
     local_layer: Optional[int] = None,
     v_sf: Optional[torch.Tensor] = None,
+    num_valid_pages: Optional[torch.Tensor] = None,
 ) -> Optional[torch.Tensor]:
     if not _triton_can_prepack_v(v_head_dim, page_size, block_v):
         return None
@@ -1767,6 +1812,7 @@ def _update_triton_v_packed_cache(
         v_head_dim=v_head_dim,
         page_size=page_size,
         block_v=block_v,
+        num_valid_pages=num_valid_pages,
     )
     _set_triton_v_packed_cache_valid(
         metadata,
@@ -1793,6 +1839,7 @@ def _maybe_update_triton_v_packed_cache(
     page_size: int,
     local_layer: Optional[int] = None,
     v_sf: Optional[torch.Tensor] = None,
+    num_valid_pages: Optional[torch.Tensor] = None,
 ) -> None:
     block_v = _select_triton_block_v(num_queries, prefer_prepacked_v=_triton_prepack_v_enabled())
     _update_triton_v_packed_cache(
@@ -1805,6 +1852,7 @@ def _maybe_update_triton_v_packed_cache(
         block_v=block_v,
         local_layer=local_layer,
         v_sf=v_sf,
+        num_valid_pages=num_valid_pages,
     )
 
 
@@ -2835,7 +2883,6 @@ def run_fp4_mla_attention_decode(
     kv_cache, sf_cache = _get_fp4_mla_kv_cache_tensors(metadata, layer_idx)
     sf_cache = sf_cache.view(torch.float8_e4m3fn)
 
-    num_gen_blocks = metadata.num_generation_blocks
     v_sf = get_fp4_mla_v_scale_pool_view(metadata, v_head_dim=kv_lora_rank)[local_layer].view(
         torch.float8_e4m3fn
     )
@@ -2844,9 +2891,7 @@ def run_fp4_mla_attention_decode(
             local_layer
         ]
 
-    src_page_ids = metadata.paged_kv_indices[
-        metadata.num_context_blocks : metadata.num_context_blocks + num_gen_blocks
-    ]
+    src_page_ids = _fp4_mla_generation_page_ids(metadata)
     # The kv_lens runtime alias can lag at the decode anchor (seq_lens == 1) under
     # CUDA graph / one-engine MTP; recover the true total per sequence so the
     # per-query causal masking sees the full 1 + draft_len window (no-op when the

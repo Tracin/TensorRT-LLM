@@ -3197,8 +3197,12 @@ class PyTorchModelEngine(ModelEngine):
         previous_pos_indices = []
         for request in extend_requests:
             request_ids.append(request.py_request_id)
+            # CUDA-graph padding dummies have no SeqSlotManager slot; keep
+            # them distinguishable (-1) so the FP4 MLA seq_slots fill below
+            # can redirect their pool writes to the trash row instead of
+            # aliasing slot 0.
             seq_slots.append(
-                request.py_seq_slot if request.py_seq_slot is not None else 0)
+                request.py_seq_slot if request.py_seq_slot is not None else -1)
             request_accepted_path[
                 request.
                 py_request_id] = request.py_num_accepted_draft_tokens_indices
@@ -3347,8 +3351,11 @@ class PyTorchModelEngine(ModelEngine):
 
             for request in generation_requests:
                 request_ids.append(request.py_request_id)
+                # -1 marks CUDA-graph padding dummies (no SeqSlotManager
+                # slot); the FP4 MLA seq_slots fill redirects them to the
+                # trash row so they cannot alias slot 0.
                 seq_slots.append(request.py_seq_slot if request.
-                                 py_seq_slot is not None else 0)
+                                 py_seq_slot is not None else -1)
                 # py_batch_idx is set after a request occupies a generation slot.
                 # None means this is its first generation step on this worker.
                 is_generation_admission = request.py_batch_idx is None
@@ -3812,8 +3819,15 @@ class PyTorchModelEngine(ModelEngine):
         if hasattr(attn_metadata,
                    'seq_slots') and attn_metadata.seq_slots is not None:
             num_seqs = len(seq_slots)
-            attn_metadata.seq_slots_cpu[:num_seqs] = torch.tensor(
-                seq_slots, dtype=torch.int32)
+            seq_slots_host = torch.tensor(seq_slots, dtype=torch.int32)
+            # Rows without a real slot (CUDA-graph padding dummies, -1) must
+            # not alias slot 0: FP4 MLA kernels scatter per-row HP-pool state
+            # through seq_slots inside captured graphs, which would corrupt
+            # the live request holding slot 0. Redirect them to the dedicated
+            # trash row one past the last real slot.
+            seq_slots_host[seq_slots_host < 0] = (
+                attn_metadata.fp4_mla_hp_trash_seq_slot)
+            attn_metadata.seq_slots_cpu[:num_seqs] = seq_slots_host
             attn_metadata.seq_slots[:num_seqs].copy_(
                 attn_metadata.seq_slots_cpu[:num_seqs], non_blocking=True)
         attn_metadata.prompt_lens = prompt_lengths
