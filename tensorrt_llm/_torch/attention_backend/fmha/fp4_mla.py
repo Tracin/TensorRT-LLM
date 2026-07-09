@@ -13,7 +13,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import TYPE_CHECKING, Optional, Tuple
+import os
+import weakref
+from dataclasses import dataclass, replace
+from typing import TYPE_CHECKING, Any, Callable, Optional, Sequence, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -32,11 +35,12 @@ from tensorrt_llm._torch.attention_backend.interface import (
     AttentionInputType,
     PredefinedAttentionMask,
 )
-from tensorrt_llm._utils import get_sm_version, is_sm_100f
+from tensorrt_llm._utils import get_sm_version, is_sm_100f, prefer_pinned
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.logger import logger
 from tensorrt_llm.quantization.mode import QuantMode
 
+from .fallback import FallbackFmha
 from .phased import FmhaParams, PhasedFmha
 
 if TYPE_CHECKING:
@@ -46,12 +50,272 @@ if TYPE_CHECKING:
     )
 
 
+FP4_MLA_FP8_CONTEXT_ENV = "TRTLLM_FP4_MLA_FP8_CONTEXT"
+_FP8_CONTEXT_SUPPORTED_SMS = {90, 100, 103, 107, 120}
+_FP8_CONTEXT_SCRATCH_ATTR = "_fp4_mla_fp8_context_scratch"
+
+
+def fp4_mla_fp8_context_enabled() -> bool:
+    """Use TRT-LLM's FP8 MLA context FMHA on supported architectures."""
+    sm = get_sm_version()
+    value = os.environ.get(FP4_MLA_FP8_CONTEXT_ENV)
+    enabled = True if value is None else value == "1"
+    return enabled and sm in _FP8_CONTEXT_SUPPORTED_SMS
+
+
+def _execute_fp8_context_with_cache_update(
+    attention_fn: Callable[[], None],
+    cache_update_fn: Callable[[], None],
+    aux_stream: Optional[torch.cuda.Stream],
+    start_event: Optional[torch.cuda.Event],
+    done_event: Optional[torch.cuda.Event],
+) -> None:
+    """Overlap FP8 context attention with its independent FP4 cache update."""
+    if aux_stream is None or start_event is None or done_event is None:
+        cache_update_fn()
+        attention_fn()
+        return
+
+    current_stream = torch.cuda.current_stream()
+    if aux_stream == current_stream:
+        cache_update_fn()
+        attention_fn()
+        return
+
+    start_event.record(current_stream)
+    attention_fn()
+    with torch.cuda.stream(aux_stream):
+        aux_stream.wait_event(start_event)
+        cache_update_fn()
+        done_event.record(aux_stream)
+    current_stream.wait_event(done_event)
+
+
+def _build_fp8_mla_context_block_tables(
+    context_lengths: Sequence[int],
+    *,
+    max_num_sequences: int,
+    max_blocks_per_seq: int,
+    page_size: int,
+    pin_memory: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor, int]:
+    """Build compact page IDs for the disposable FP8 context cache."""
+    if len(context_lengths) > max_num_sequences:
+        raise ValueError(
+            f"FP8 MLA context scratch supports at most {max_num_sequences} sequences, "
+            f"got {len(context_lengths)}."
+        )
+
+    block_ids = torch.zeros(
+        max_num_sequences,
+        max_blocks_per_seq,
+        dtype=torch.int32,
+        device="cpu",
+        pin_memory=pin_memory,
+    )
+    next_block = 0
+    for seq_idx, context_length in enumerate(context_lengths):
+        context_length = int(context_length)
+        if context_length < 0:
+            raise ValueError(f"Context length must be non-negative, got {context_length}.")
+        num_blocks = (context_length + page_size - 1) // page_size
+        if num_blocks > max_blocks_per_seq:
+            raise ValueError(
+                f"Context sequence requires {num_blocks} FP8 scratch blocks, but the "
+                f"page table holds only {max_blocks_per_seq}."
+            )
+        if num_blocks:
+            block_ids[seq_idx, :num_blocks] = torch.arange(
+                next_block,
+                next_block + num_blocks,
+                dtype=torch.int32,
+            )
+            next_block += num_blocks
+
+    block_offsets = torch.zeros(
+        1,
+        max_num_sequences,
+        2,
+        max_blocks_per_seq,
+        dtype=torch.int32,
+        device="cpu",
+        pin_memory=pin_memory,
+    )
+    block_offsets[0, :, 0].copy_(block_ids)
+    block_offsets[0, :, 1].copy_(block_ids)
+    return block_offsets, block_ids, next_block
+
+
+@dataclass
+class _Fp8MlaContextScratch:
+    pool: torch.Tensor
+    block_offsets: torch.Tensor
+    block_ids_per_seq: torch.Tensor
+    host_pool_pointers: torch.Tensor
+    host_pool_mapping: torch.Tensor
+    max_num_sequences: int
+    max_blocks_per_seq: int
+    capacity_blocks: int
+    page_size: int
+    head_dim: int
+    cache_stream: torch.cuda.Stream
+    cache_start_event: torch.cuda.Event
+    cache_done_event: torch.cuda.Event
+    mapping_signature: Optional[Tuple[int, ...]] = None
+    host_staging: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
+
+    @classmethod
+    def create(
+        cls,
+        meta: "TrtllmAttentionMetadata",
+        *,
+        device: torch.device,
+        head_dim: int,
+    ) -> "_Fp8MlaContextScratch":
+        kv_cache_manager = meta.kv_cache_manager
+        if kv_cache_manager is None:
+            raise RuntimeError("FP8 MLA context scratch requires a KV cache manager.")
+
+        page_size = int(meta.tokens_per_block)
+        max_num_sequences = int(meta.max_num_sequences or meta.max_num_requests)
+        max_blocks_per_seq = int(kv_cache_manager.max_blocks_per_seq)
+        max_num_tokens = int(meta.max_num_tokens)
+        max_nonempty_sequences = min(max_num_sequences, max_num_tokens)
+        capacity_blocks = max(
+            1,
+            (max_num_tokens + page_size - 1) // page_size + max(0, max_nonempty_sequences - 1),
+        )
+        pool = torch.empty(
+            capacity_blocks * page_size * head_dim,
+            dtype=torch.float8_e4m3fn,
+            device=device,
+        )
+        block_offsets = torch.zeros(
+            1,
+            max_num_sequences,
+            2,
+            max_blocks_per_seq,
+            dtype=torch.int32,
+            device=device,
+        )
+        block_ids_per_seq = torch.zeros(
+            max_num_sequences,
+            max_blocks_per_seq,
+            dtype=torch.int32,
+            device=device,
+        )
+        host_pool_pointers = torch.tensor(
+            [[pool.data_ptr(), 0]],
+            dtype=torch.int64,
+            device="cpu",
+            pin_memory=prefer_pinned(),
+        )
+        host_pool_mapping = torch.zeros(
+            1,
+            2,
+            dtype=torch.int32,
+            device="cpu",
+            pin_memory=prefer_pinned(),
+        )
+        return cls(
+            pool=pool,
+            block_offsets=block_offsets,
+            block_ids_per_seq=block_ids_per_seq,
+            host_pool_pointers=host_pool_pointers,
+            host_pool_mapping=host_pool_mapping,
+            max_num_sequences=max_num_sequences,
+            max_blocks_per_seq=max_blocks_per_seq,
+            capacity_blocks=capacity_blocks,
+            page_size=page_size,
+            head_dim=head_dim,
+            cache_stream=torch.cuda.Stream(device=device),
+            cache_start_event=torch.cuda.Event(),
+            cache_done_event=torch.cuda.Event(),
+        )
+
+    def matches(
+        self,
+        meta: "TrtllmAttentionMetadata",
+        *,
+        device: torch.device,
+        head_dim: int,
+    ) -> bool:
+        kv_cache_manager = meta.kv_cache_manager
+        return (
+            kv_cache_manager is not None
+            and self.pool.device == device
+            and self.head_dim == head_dim
+            and self.page_size == meta.tokens_per_block
+            and self.max_num_sequences >= int(meta.max_num_sequences or meta.max_num_requests)
+            and self.max_blocks_per_seq >= int(kv_cache_manager.max_blocks_per_seq)
+        )
+
+    def prepare(self, meta: "TrtllmAttentionMetadata") -> None:
+        context_lengths = tuple(
+            int(length) for length in meta.prompt_lens_cpu_runtime[: meta.num_contexts].tolist()
+        )
+        if context_lengths == self.mapping_signature:
+            return
+
+        host_offsets, host_block_ids, required_blocks = _build_fp8_mla_context_block_tables(
+            context_lengths,
+            max_num_sequences=self.max_num_sequences,
+            max_blocks_per_seq=self.max_blocks_per_seq,
+            page_size=self.page_size,
+            pin_memory=prefer_pinned(),
+        )
+        if required_blocks > self.capacity_blocks:
+            raise RuntimeError(
+                f"FP8 MLA context scratch requires {required_blocks} blocks, but only "
+                f"{self.capacity_blocks} were allocated."
+            )
+        self.block_offsets.copy_(host_offsets, non_blocking=True)
+        self.block_ids_per_seq.copy_(host_block_ids, non_blocking=True)
+        self.mapping_signature = context_lengths
+        self.host_staging = (host_offsets, host_block_ids)
+
+
+class _Fp8MlaContextAttnProxy:
+    """Override cache-only attention attributes while forwarding model config."""
+
+    def __init__(self, attn: "TrtllmAttention") -> None:
+        self._attn = weakref.proxy(attn)
+        self.quant_mode = int(QuantMode(0).set_fp8_kv_cache())
+        self.local_layer_idx = 0
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._attn, name)
+
+
+class _Fp8MlaContextMetadataProxy:
+    """Route only the mandatory FP8 cache write to disposable storage."""
+
+    def __init__(
+        self,
+        meta: "TrtllmAttentionMetadata",
+        scratch: _Fp8MlaContextScratch,
+    ) -> None:
+        self._meta = meta
+        self.kv_cache_block_offsets = scratch.block_offsets
+        self.host_kv_cache_pool_pointers = scratch.host_pool_pointers
+        self.host_kv_cache_pool_mapping = scratch.host_pool_mapping
+        self.block_ids_per_seq = scratch.block_ids_per_seq
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._meta, name)
+
+
 class Fp4MlaFmha(PhasedFmha):
     """TRTLLM FMHA library for the no-dequant NVFP4 MLA decode kernel."""
 
     SUPPORTED_Q_DTYPES = {torch.bfloat16, torch.float8_e4m3fn}
     SUPPORTED_CONTEXT_DTYPES = {torch.float16, torch.bfloat16}
     SUPPORTED_OUTPUT_DTYPES = {torch.float16, torch.bfloat16}
+
+    def __init__(self, attn: "TrtllmAttention") -> None:
+        super().__init__(attn)
+        self._fp8_context_attn_proxy = _Fp8MlaContextAttnProxy(attn)
+        self._fp8_context_fmha = FallbackFmha(self._fp8_context_attn_proxy)
 
     @classmethod
     def is_available(cls, attn: "TrtllmAttention") -> bool:
@@ -327,22 +591,7 @@ class Fp4MlaFmha(PhasedFmha):
 
         attn._ensure_rope_table_size(meta.max_seq_len)
         positions = meta.positions[:num_tokens]
-        q_ctx = params.qkv_input.view(num_tokens, attn.num_heads, qk_head_dim)
-        k_ctx = params.k_input.view(num_tokens, attn.num_heads, qk_head_dim)
-        v_ctx = params.v_input.view(num_tokens, attn.num_heads, v_head_dim)
-
-        q_nope = q_ctx[..., :qk_nope_head_dim]
-        q_pe = q_ctx[..., qk_nope_head_dim:]
-        k_nope = k_ctx[..., :qk_nope_head_dim]
         k_pe = fwd.latent_cache[:num_tokens, kv_lora_rank:].unsqueeze(1)
-
-        q_pe = apply_fp4_mla_rope(
-            q_pe,
-            positions,
-            attn.rotary_cos_sin,
-            attn.rope_params.max_positions,
-            qk_rope_head_dim,
-        )
         k_pe = apply_fp4_mla_rope(
             k_pe,
             positions,
@@ -354,16 +603,75 @@ class Fp4MlaFmha(PhasedFmha):
         latent_cache = torch.empty_like(fwd.latent_cache[:num_tokens])
         latent_cache[..., :kv_lora_rank].copy_(fwd.latent_cache[:num_tokens, :kv_lora_rank])
         latent_cache[..., kv_lora_rank:].copy_(k_pe)
-        scatter_fp4_mla_kv_cache(
-            meta,
-            latent_cache,
-            attn.layer_idx,
-            token_offset=0,
-            phase="context",
-            local_layer=local_layer,
-            v_head_dim=kv_lora_rank,
+
+        def update_fp4_cache() -> None:
+            scatter_fp4_mla_kv_cache(
+                meta,
+                latent_cache,
+                attn.layer_idx,
+                token_offset=0,
+                phase="context",
+                local_layer=local_layer,
+                v_head_dim=kv_lora_rank,
+            )
+            update_hp_kv_for_fp4_mla(meta, latent_cache, local_layer, phase="context")
+
+        if fp4_mla_fp8_context_enabled() and not meta.is_cuda_graph:
+            # FP8 context FMHA reads its Q/K/V workspace; this cache only absorbs
+            # the native RoPE helper's mandatory paged-cache write.
+            kv_cache_manager = meta.kv_cache_manager
+            if kv_cache_manager is None:
+                raise RuntimeError("FP8 MLA context scratch requires a KV cache manager.")
+            scratch = getattr(kv_cache_manager, _FP8_CONTEXT_SCRATCH_ATTR, None)
+            scratch_head_dim = kv_lora_rank + qk_rope_head_dim
+            if not isinstance(scratch, _Fp8MlaContextScratch) or not scratch.matches(
+                meta,
+                device=params.qkv_input.device,
+                head_dim=scratch_head_dim,
+            ):
+                scratch = _Fp8MlaContextScratch.create(
+                    meta,
+                    device=params.qkv_input.device,
+                    head_dim=scratch_head_dim,
+                )
+                setattr(kv_cache_manager, _FP8_CONTEXT_SCRATCH_ATTR, scratch)
+            scratch.prepare(meta)
+
+            fp8_meta = _Fp8MlaContextMetadataProxy(meta, scratch)
+            fp8_fwd = replace(
+                fwd,
+                kv_scale_orig_quant=attn.kv_scale_orig_quant,
+                kv_scale_quant_orig=attn.kv_scale_quant_orig,
+            )
+            _execute_fp8_context_with_cache_update(
+                lambda: self._fp8_context_fmha.forward(
+                    params.qkv_input,
+                    params.k_input,
+                    params.v_input,
+                    fp8_meta,
+                    fp8_fwd,
+                ),
+                update_fp4_cache,
+                scratch.cache_stream,
+                scratch.cache_start_event,
+                scratch.cache_done_event,
+            )
+            return
+
+        update_fp4_cache()
+        q_ctx = params.qkv_input.view(num_tokens, attn.num_heads, qk_head_dim)
+        k_ctx = params.k_input.view(num_tokens, attn.num_heads, qk_head_dim)
+        v_ctx = params.v_input.view(num_tokens, attn.num_heads, v_head_dim)
+        q_nope = q_ctx[..., :qk_nope_head_dim]
+        q_pe = q_ctx[..., qk_nope_head_dim:]
+        k_nope = k_ctx[..., :qk_nope_head_dim]
+        q_pe = apply_fp4_mla_rope(
+            q_pe,
+            positions,
+            attn.rotary_cos_sin,
+            attn.rope_params.max_positions,
+            qk_rope_head_dim,
         )
-        update_hp_kv_for_fp4_mla(meta, latent_cache, local_layer, phase="context")
 
         q_ctx = torch.cat((q_nope, q_pe), dim=-1)
         k_ctx = torch.cat((k_nope, k_pe.unsqueeze(1).expand(-1, attn.num_heads, -1)), dim=-1)
