@@ -97,6 +97,14 @@ BlocksPerWindow = Dict[int, Tuple[
     int,
     int]]  # window_size -> (blocks_in_primary_pool, blocks_in_secondary_pool)
 
+_FP4_MLA_K_RESIDUAL_DIM = 64
+_FP4_MLA_ATTENTION_BACKEND_ENV = "TRTLLM_FP4_MLA_ATTENTION_BACKEND"
+
+
+def _fp4_mla_contiguous_k_residual_enabled() -> bool:
+    return os.getenv(_FP4_MLA_ATTENTION_BACKEND_ENV,
+                     "triton").lower() == "triton"
+
 
 class Role:
     KEY = DataRole("key")
@@ -392,6 +400,9 @@ class KVCacheManager(BaseResourceManager):
         self.max_seq_len = max_seq_len
         self.max_batch_size = max_batch_size
         self.kv_factor = 1 if kv_cache_type == CacheTypeCpp.SELFKONLY else 2
+        self.fp4_mla_k_residual_dim = (
+            _FP4_MLA_K_RESIDUAL_DIM if self._enable_mla_v_scale_pool()
+            and _fp4_mla_contiguous_k_residual_enabled() else 0)
         # Some speculative decoding methods need to use different kv lengths for the
         # draft/target layers. Add extra tokens to handle this issue.
         # Import here to avoid circular imports
@@ -592,15 +603,16 @@ class KVCacheManager(BaseResourceManager):
         # ``size_per_head``).  Translate at the C++ boundary so nanobind can
         # dispatch the ctor.
         pool_configurations_cpp = [
-            PoolConfigurationCpp(window_size=pc.window_size,
-                                 size_per_head=pc.head_dim,
-                                 dtype=pc.dtype)
-            for pc in self.pool_configurations
+            PoolConfigurationCpp(
+                window_size=pc.window_size,
+                size_per_head=self._get_storage_head_dim(pc.head_dim, pc.dtype),
+                dtype=pc.dtype,
+            ) for pc in self.pool_configurations
         ]
 
         kwargs = {
             'num_kv_heads_per_layer': self.num_kv_heads_per_layer,
-            'size_per_head': head_dim,
+            'size_per_head': self._get_storage_head_dim(head_dim, dtype),
             'tokens_per_block': tokens_per_block,
             'blocks_per_window': blocks_per_window,
             'max_num_sequences': max_batch_size,
@@ -1172,6 +1184,8 @@ class KVCacheManager(BaseResourceManager):
             mem_per_token *= 1
         elif quant_config is not None and quant_config.quant_mode.has_fp4_kv_cache(
         ):
+            if mla and _fp4_mla_contiguous_k_residual_enabled():
+                mem_per_token += num_attention_layers * _FP4_MLA_K_RESIDUAL_DIM
             # 1 bytes for 2 elements, and SFs (fp8) per 16 elements.
             mem_per_token = math.ceil(mem_per_token / 2) + math.ceil(
                 mem_per_token / 16)
@@ -1187,11 +1201,13 @@ class KVCacheManager(BaseResourceManager):
         if isinstance(self.head_dim, list):
             # Per-layer head_dim (e.g., Gemma4 hybrid attention)
             cache_size_per_token = self.kv_factor * sum(
-                kv * hd for kv, hd in zip(self.total_num_kv_heads_per_layer,
-                                          self.head_dim))
+                kv * self._get_storage_head_dim(hd, self.dtype)
+                for kv, hd in zip(self.total_num_kv_heads_per_layer,
+                                  self.head_dim))
         else:
             cache_size_per_token = self.kv_factor * sum(
-                self.num_kv_heads_per_layer) * self.head_dim
+                self.num_kv_heads_per_layer) * self._get_storage_head_dim(
+                    self.head_dim, self.dtype)
 
         if self.dtype not in (DataType.FP8, DataType.HALF, DataType.BF16,
                               DataType.FLOAT, DataType.NVFP4):
@@ -1212,13 +1228,19 @@ class KVCacheManager(BaseResourceManager):
         return (self.dtype == DataType.NVFP4
                 and self.kv_cache_type == CacheTypeCpp.SELFKONLY)
 
+    def _get_storage_head_dim(self, head_dim: int, dtype: DataType) -> int:
+        if dtype == DataType.NVFP4:
+            return head_dim + self.fp4_mla_k_residual_dim
+        return head_dim
+
     def _get_mla_v_scale_bytes_per_token(self, num_layers: int) -> int:
         if not self._enable_mla_v_scale_pool():
             return 0
         token_scale_cols = math.ceil(self.tokens_per_block / 16)
         # Match the C++ per-page allocation and spread it across page tokens
         # for scheduler capacity accounting.
-        elems_per_page = (math.ceil(self.head_dim / 128) *
+        storage_head_dim = self._get_storage_head_dim(self.head_dim, self.dtype)
+        elems_per_page = (math.ceil(storage_head_dim / 128) *
                           math.ceil(token_scale_cols / 4) * 32 * 16)
         return num_layers * math.ceil(elems_per_page / self.tokens_per_block)
 
@@ -1479,6 +1501,7 @@ class KVCacheManager(BaseResourceManager):
         pool = self.get_pool_for_layer(layer_offset)
         layer_head_dim = pool.head_dim if pool else self.head_dim
         layer_dtype = pool.dtype if pool else self.dtype
+        layer_head_dim = self._get_storage_head_dim(layer_head_dim, layer_dtype)
 
         assert kv_layout in ["NHD",
                              "HND"], f"Unsupported kv_layout: {kv_layout}"
@@ -1519,6 +1542,7 @@ class KVCacheManager(BaseResourceManager):
         pool = self.get_pool_for_layer(layer_offset)
         layer_head_dim = pool.head_dim if pool else self.head_dim
         layer_dtype = pool.dtype if pool else self.dtype
+        layer_head_dim = self._get_storage_head_dim(layer_head_dim, layer_dtype)
         if layer_dtype != DataType.NVFP4:
             return None
 
@@ -1686,12 +1710,17 @@ class KVCacheManager(BaseResourceManager):
         del window_size  # kept for compat; resolution is now per-layer
         if not self.pool_configurations:
             total_kv_heads = sum(self.num_kv_heads_per_layer[i] for i in layers)
-            return total_kv_heads * self.kv_factor * self.head_dim
+            storage_head_dim = self._get_storage_head_dim(
+                self.head_dim, self.dtype)
+            return total_kv_heads * self.kv_factor * storage_head_dim
 
         total = 0
         for i in layers:
             pool = self.get_pool_for_layer(i)
             layer_head_dim = pool.head_dim if pool else self.head_dim
+            layer_dtype = pool.dtype if pool else self.dtype
+            layer_head_dim = self._get_storage_head_dim(layer_head_dim,
+                                                        layer_dtype)
             total += self.num_kv_heads_per_layer[i] * layer_head_dim
         return total * self.kv_factor
 
@@ -1715,6 +1744,8 @@ class KVCacheManager(BaseResourceManager):
             pool = self.get_pool_for_layer(i)
             layer_head_dim = pool.head_dim if pool else self.head_dim
             layer_dtype = pool.dtype if pool else dtype_default
+            layer_head_dim = self._get_storage_head_dim(layer_head_dim,
+                                                        layer_dtype)
             layer_elements = (self.num_kv_heads_per_layer[i] * self.kv_factor *
                               layer_head_dim)
             layer_bytes = get_size_in_bytes(layer_elements, layer_dtype)

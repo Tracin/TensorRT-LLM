@@ -682,6 +682,8 @@ def _fp4_mla_v_scale_store_context_tokens_kernel(
     FP4_BLOCK: tl.constexpr,
     SF_PER_TOKEN: tl.constexpr,
     SF_PER_PAGE: tl.constexpr,
+    K_RESIDUAL_D: tl.constexpr,
+    STORE_K_RESIDUAL: tl.constexpr,
     KV_GLOBAL_SCALE_PER_PAGE: tl.constexpr,
 ):
     token_idx = tl.program_id(0)
@@ -782,8 +784,12 @@ def _fp4_mla_v_scale_store_context_tokens_kernel(
     stored_scale = tl.minimum(local_scale * kv_global_scale, 448.0)
     v_stored_scale = tl.minimum(tile_scale * kv_global_scale, 448.0)
 
-    low = _fp4_e2m1_quantize(even_values / local_scale[:, None])
-    high = _fp4_e2m1_quantize(odd_values / local_scale[:, None])
+    quant_scale = local_scale
+    if STORE_K_RESIDUAL:
+        if dim_block * FP4_BLOCK >= HEAD_D - K_RESIDUAL_D:
+            quant_scale = stored_scale.to(tl.float8e4nv).to(tl.float32) / kv_global_scale
+    low = _fp4_e2m1_quantize(even_values / quant_scale[:, None])
+    high = _fp4_e2m1_quantize(odd_values / quant_scale[:, None])
     packed = low | (high << 4)
 
     packed_cols = dim_block * (FP4_BLOCK // 2) + byte_offsets
@@ -797,6 +803,46 @@ def _fp4_mla_v_scale_store_context_tokens_kernel(
 
     k_sf_offsets = _fp4_mla_swizzled_sf_offset(page_positions, dim_block, SF_PER_TOKEN)
     tl.store(sf_cache_ptr + physical_page * sf_s0 + k_sf_offsets, stored_scale, mask=valid_tokens)
+
+    if STORE_K_RESIDUAL:
+        residual_start = HEAD_D - K_RESIDUAL_D
+        if dim_block * FP4_BLOCK >= residual_start:
+            main_even = _fp4_e2m1_to_f32(low) * quant_scale[:, None]
+            main_odd = _fp4_e2m1_to_f32(high) * quant_scale[:, None]
+            residual_even = even_values - main_even
+            residual_odd = odd_values - main_odd
+            residual_amax = tl.maximum(
+                tl.max(tl.abs(residual_even), axis=1),
+                tl.max(tl.abs(residual_odd), axis=1),
+            )
+            residual_scale = tl.where(residual_amax > 0.0, residual_amax / 6.0, 1.0)
+            residual_stored_scale = tl.minimum(residual_scale * kv_global_scale, 448.0)
+            residual_quant_scale = (
+                residual_stored_scale.to(tl.float8e4nv).to(tl.float32) / kv_global_scale
+            )
+            residual_low = _fp4_e2m1_quantize(residual_even / residual_quant_scale[:, None])
+            residual_high = _fp4_e2m1_quantize(residual_odd / residual_quant_scale[:, None])
+            residual_packed = residual_low | (residual_high << 4)
+            residual_group = dim_block - residual_start // FP4_BLOCK
+            residual_packed_cols = HEAD_D // 2 + residual_group * (FP4_BLOCK // 2) + byte_offsets
+            tl.store(
+                kv_cache_ptr
+                + kv_base
+                + page_positions[:, None] * kv_s2
+                + residual_packed_cols[None, :] * kv_s4,
+                residual_packed,
+                mask=valid_tokens[:, None] & mask_even_d[None, :],
+            )
+            residual_sf_offsets = _fp4_mla_swizzled_sf_offset(
+                page_positions,
+                HEAD_D // FP4_BLOCK + residual_group,
+                SF_PER_TOKEN,
+            )
+            tl.store(
+                sf_cache_ptr + physical_page * sf_s0 + residual_sf_offsets,
+                residual_stored_scale,
+                mask=valid_tokens,
+            )
 
     token_scale_col = page_pos // HP_BLOCK
     sf_offsets = _fp4_mla_swizzled_sf_offset(safe_all_d, token_scale_col, SF_PER_PAGE)
@@ -1004,6 +1050,8 @@ def _fp4_mla_generation_fused_qk_rope_cache_update_kernel(
     FP4_BLOCK: tl.constexpr,
     SF_PER_TOKEN: tl.constexpr,
     SF_PER_PAGE: tl.constexpr,
+    K_RESIDUAL_D: tl.constexpr,
+    STORE_K_RESIDUAL: tl.constexpr,
     REWRITE_PAGE: tl.constexpr,
     KV_GLOBAL_SCALE_PER_PAGE: tl.constexpr,
     FUSE_ROPE_CACHE_STORE: tl.constexpr,
@@ -1254,8 +1302,12 @@ def _fp4_mla_generation_fused_qk_rope_cache_update_kernel(
             stored_scale = local_scale * global_scale
             v_stored_scale = tile_scale * global_scale
 
-        low = _fp4_e2m1_quantize(even_values / local_scale[:, None])
-        high = _fp4_e2m1_quantize(odd_values / local_scale[:, None])
+        quant_scale = local_scale
+        if STORE_K_RESIDUAL:
+            if dim_block * FP4_BLOCK >= HEAD_D - K_RESIDUAL_D:
+                quant_scale = stored_scale.to(tl.float8e4nv).to(tl.float32) / global_scale
+        low = _fp4_e2m1_quantize(even_values / quant_scale[:, None])
+        high = _fp4_e2m1_quantize(odd_values / quant_scale[:, None])
         packed = low | (high << 4)
 
         packed_cols = dim_block * (FP4_BLOCK // 2) + byte_offsets
@@ -1273,6 +1325,51 @@ def _fp4_mla_generation_fused_qk_rope_cache_update_kernel(
             stored_scale,
             mask=valid_tokens,
         )
+
+        if STORE_K_RESIDUAL:
+            residual_start = HEAD_D - K_RESIDUAL_D
+            if dim_block * FP4_BLOCK >= residual_start:
+                main_even = _fp4_e2m1_to_f32(low) * quant_scale[:, None]
+                main_odd = _fp4_e2m1_to_f32(high) * quant_scale[:, None]
+                residual_even = even_values - main_even
+                residual_odd = odd_values - main_odd
+                residual_amax = tl.maximum(
+                    tl.max(tl.abs(residual_even), axis=1),
+                    tl.max(tl.abs(residual_odd), axis=1),
+                )
+                residual_scale = tl.where(residual_amax > 0.0, residual_amax / 6.0, 1.0)
+                if KV_GLOBAL_SCALE_PER_PAGE:
+                    residual_stored_scale = tl.minimum(residual_scale * global_scale, 448.0)
+                else:
+                    residual_stored_scale = residual_scale * global_scale
+                residual_quant_scale = (
+                    residual_stored_scale.to(tl.float8e4nv).to(tl.float32) / global_scale
+                )
+                residual_low = _fp4_e2m1_quantize(residual_even / residual_quant_scale[:, None])
+                residual_high = _fp4_e2m1_quantize(residual_odd / residual_quant_scale[:, None])
+                residual_packed = residual_low | (residual_high << 4)
+                residual_group = dim_block - residual_start // FP4_BLOCK
+                residual_packed_cols = (
+                    HEAD_D // 2 + residual_group * (FP4_BLOCK // 2) + byte_offsets
+                )
+                tl.store(
+                    kv_cache_ptr
+                    + kv_base
+                    + page_positions[:, None] * kv_s2
+                    + residual_packed_cols[None, :] * kv_s4,
+                    residual_packed,
+                    mask=valid_tokens[:, None] & mask_even_d[None, :],
+                )
+                residual_sf_offsets = _fp4_mla_swizzled_sf_offset(
+                    page_positions,
+                    HEAD_D // FP4_BLOCK + residual_group,
+                    SF_PER_TOKEN,
+                )
+                tl.store(
+                    sf_cache_ptr + physical_page * sf_s0 + residual_sf_offsets,
+                    residual_stored_scale,
+                    mask=valid_tokens,
+                )
 
         token_scale_col = page_pos // HP_BLOCK
         sf_offsets = _fp4_mla_swizzled_sf_offset(safe_all_d, token_scale_col, SF_PER_PAGE)

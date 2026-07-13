@@ -11,8 +11,7 @@ or any private-Triton extension):
 
 * ``USE_TMA_DATA_LOAD`` path through ``_fp4_mla_qk_scores_tile`` -- builds
   device-side TMA descriptors via ``tl.make_tensor_descriptor`` for the
-  full-K window and the Q residual tail, with the residual-Q permute/split
-  idiom that maps the Q tail's interleaved groups onto the K tail.
+  full-K window, then gathers the virtual ``[Q, Q_r, Q] x [K, K, K_r]`` tail.
 * ``ASSUME_FULL_HEADS`` / ``ASSUME_FULL_PAGES`` / ``ASSUME_VALID_PAGES``
   constexpr branches that drop ``tl.where`` masks on the hot decode path.
 * ``PACK_PROBS`` fused page-stats kernel that quantizes P to FP4 in registers
@@ -430,8 +429,10 @@ def _fp4_mla_qk_scores_tile(
     page_ids_len,
     num_pages,
     Q_HEAD_D: tl.constexpr,
+    Q_STORAGE_HEAD_D: tl.constexpr,
     K_HEAD_D: tl.constexpr,
     Q_RESIDUAL_D: tl.constexpr,
+    K_RESIDUAL_D: tl.constexpr,
     FP4_BLOCK: tl.constexpr,
     Q_SF_PER_TOKEN: tl.constexpr,
     K_SF_PER_TOKEN: tl.constexpr,
@@ -470,7 +471,7 @@ def _fp4_mla_qk_scores_tile(
 
     packed_k_offsets = tl.arange(0, BLOCK_K // 2)
     scale_offsets = tl.arange(0, BLOCK_K // FP4_BLOCK)
-    residual_groups = Q_RESIDUAL_D // FP4_BLOCK
+    residual_groups = K_RESIDUAL_D // FP4_BLOCK
     non_residual_groups = K_HEAD_D // FP4_BLOCK - residual_groups
     if USE_TMA_DATA_LOAD and FULL_BLOCK_END > 0:
         tl.assume(q_fp4_s0 % 8 == 0)
@@ -480,7 +481,7 @@ def _fp4_mla_qk_scores_tile(
         tl.assume(kv_s4 == 1)
         q_desc = tl.make_tensor_descriptor(
             q_fp4_ptr,
-            shape=[q_num_rows, Q_HEAD_D // 2],
+            shape=[q_num_rows, Q_STORAGE_HEAD_D // 2],
             strides=[q_fp4_s0, q_fp4_s1],
             block_shape=[BLOCK_H, BLOCK_K // 2],
         )
@@ -493,7 +494,7 @@ def _fp4_mla_qk_scores_tile(
     if USE_TMA_DATA_LOAD and Q_RESIDUAL_D == 64 and TAIL_BLOCK_K == 128:
         q_tail_desc = tl.make_tensor_descriptor(
             q_fp4_ptr,
-            shape=[q_num_rows, Q_HEAD_D // 2],
+            shape=[q_num_rows, Q_STORAGE_HEAD_D // 2],
             strides=[q_fp4_s0, q_fp4_s1],
             block_shape=[BLOCK_H, 64],
         )
@@ -680,17 +681,25 @@ def _fp4_mla_qk_scores_tile(
             tail_scale_offsets = tl.arange(0, TAIL_BLOCK_K // FP4_BLOCK)
             q_elem_offsets = q_start + tail_packed_offsets * 2
             q_group_offsets = q_elem_offsets // FP4_BLOCK
-            k_group_offsets = tl.where(
-                q_group_offsets < non_residual_groups,
-                q_group_offsets,
-                non_residual_groups + (q_group_offsets - non_residual_groups) // 2,
+            virtual_tail_groups = q_group_offsets - non_residual_groups
+            residual_group_offsets = virtual_tail_groups % residual_groups
+            residual_phase = virtual_tail_groups // residual_groups
+            q_group_offsets = (
+                non_residual_groups
+                + residual_group_offsets * 2
+                + tl.where(residual_phase == 1, 1, 0)
             )
+            k_group_offsets = non_residual_groups + residual_group_offsets
             byte_offsets_in_group = (q_elem_offsets % FP4_BLOCK) // 2
-            packed_q_cols = q_start // 2 + tail_packed_offsets
+            packed_q_cols = q_group_offsets * (FP4_BLOCK // 2) + byte_offsets_in_group
             packed_k_cols = k_group_offsets * (FP4_BLOCK // 2) + byte_offsets_in_group
-            mask_k = q_elem_offsets < Q_HEAD_D
+            packed_kr_cols = (
+                K_HEAD_D // 2 + residual_group_offsets * (FP4_BLOCK // 2) + byte_offsets_in_group
+            )
+            mask_k = (q_elem_offsets < Q_HEAD_D) & (residual_phase < 3)
             safe_packed_q_cols = tl.where(mask_k, packed_q_cols, 0)
             safe_packed_k_cols = tl.where(mask_k, packed_k_cols, 0)
+            safe_packed_kr_cols = tl.where(mask_k, packed_kr_cols, 0)
             q_vals = tl.load(
                 q_fp4_ptr
                 + safe_q_rows[:, None] * q_fp4_s0
@@ -698,7 +707,7 @@ def _fp4_mla_qk_scores_tile(
                 mask=mask_k[None, :] if ASSUME_FULL_HEADS else mask_h[:, None] & mask_k[None, :],
                 other=0,
             )
-            k_vals = tl.load(
+            k_main_vals = tl.load(
                 kv_cache_ptr
                 + safe_physical_page * kv_s0
                 + token_offsets[:, None].to(tl.int64) * kv_s2
@@ -708,16 +717,30 @@ def _fp4_mla_qk_scores_tile(
                 else valid_physical_page & mask_k[None, :],
                 other=0,
             )
-
-            q_sf_cols = q_start // FP4_BLOCK + tail_scale_offsets
-            k_sf_cols = tl.where(
-                q_sf_cols < non_residual_groups,
-                q_sf_cols,
-                non_residual_groups + (q_sf_cols - non_residual_groups) // 2,
+            k_residual_vals = tl.load(
+                kv_cache_ptr
+                + safe_physical_page * kv_s0
+                + token_offsets[:, None].to(tl.int64) * kv_s2
+                + safe_packed_kr_cols[None, :] * kv_s4,
+                mask=(mask_k & (residual_phase == 2))[None, :]
+                if ASSUME_VALID_PAGES
+                else valid_physical_page & (mask_k & (residual_phase == 2))[None, :],
+                other=0,
             )
-            mask_sf = q_sf_cols < Q_SF_PER_TOKEN
+            k_vals = tl.where((residual_phase == 2)[None, :], k_residual_vals, k_main_vals)
+
+            virtual_q_sf_cols = q_start // FP4_BLOCK + tail_scale_offsets
+            virtual_sf_tail = virtual_q_sf_cols - non_residual_groups
+            residual_sf_cols = virtual_sf_tail % residual_groups
+            residual_sf_phase = virtual_sf_tail // residual_groups
+            q_sf_cols = (
+                non_residual_groups + residual_sf_cols * 2 + tl.where(residual_sf_phase == 1, 1, 0)
+            )
+            k_sf_cols = non_residual_groups + residual_sf_cols
+            mask_sf = (virtual_q_sf_cols < Q_HEAD_D // FP4_BLOCK) & (residual_sf_phase < 3)
             safe_q_sf_cols = tl.where(mask_sf, q_sf_cols, 0)
             safe_k_sf_cols = tl.where(mask_sf, k_sf_cols, 0)
+            safe_kr_sf_cols = tl.where(mask_sf, K_HEAD_D // FP4_BLOCK + residual_sf_cols, 0)
             q_sf_offsets = _fp4_mla_swizzled_sf_offset(
                 safe_q_rows[:, None], safe_q_sf_cols[None, :], Q_SF_PER_TOKEN
             )
@@ -725,7 +748,20 @@ def _fp4_mla_qk_scores_tile(
                 token_offsets[:, None], safe_k_sf_cols[None, :], K_SF_PER_TOKEN
             )
             q_scales = tl.load(q_sf_ptr + q_sf_offsets)
-            k_scales = tl.load(sf_cache_ptr + safe_physical_page * sf_s0 + k_sf_offsets)
+            k_main_scales = tl.load(
+                sf_cache_ptr + safe_physical_page * sf_s0 + k_sf_offsets,
+                mask=mask_sf[None, :],
+                other=0.0,
+            )
+            k_residual_sf_offsets = _fp4_mla_swizzled_sf_offset(
+                token_offsets[:, None], safe_kr_sf_cols[None, :], K_SF_PER_TOKEN
+            )
+            k_residual_scales = tl.load(
+                sf_cache_ptr + safe_physical_page * sf_s0 + k_residual_sf_offsets,
+                mask=(mask_sf & (residual_sf_phase == 2))[None, :],
+                other=0.0,
+            )
+            k_scales = tl.where((residual_sf_phase == 2)[None, :], k_residual_scales, k_main_scales)
             scores = tl.dot_scaled(
                 q_vals,
                 q_scales,
@@ -774,8 +810,10 @@ def _fp4_mla_attention_page_stats_kernel(
     sm_scale,
     NUM_HEADS: tl.constexpr,
     Q_HEAD_D: tl.constexpr,
+    Q_STORAGE_HEAD_D: tl.constexpr,
     K_HEAD_D: tl.constexpr,
     Q_RESIDUAL_D: tl.constexpr,
+    K_RESIDUAL_D: tl.constexpr,
     PAGE_SIZE: tl.constexpr,
     FP4_BLOCK: tl.constexpr,
     Q_SF_PER_TOKEN: tl.constexpr,
@@ -861,8 +899,10 @@ def _fp4_mla_attention_page_stats_kernel(
             page_ids_len,
             num_pages,
             Q_HEAD_D,
+            Q_STORAGE_HEAD_D,
             K_HEAD_D,
             Q_RESIDUAL_D,
+            K_RESIDUAL_D,
             FP4_BLOCK,
             Q_SF_PER_TOKEN,
             K_SF_PER_TOKEN,

@@ -16,6 +16,7 @@ from tensorrt_llm._torch.attention_backend.fp4_mla import (
     FP4_MLA_ATTENTION_BACKEND_ENV,
     FP4_MLA_CUTILE_GLOBAL_SCALE,
     FP4_MLA_DYNAMIC_GLOBAL_SCALE_ENV,
+    FP4_MLA_K_RESIDUAL_DIM,
     FP4_MLA_KV_GLOBAL_SCALE,
     FP4_MLA_P_GLOBAL_SCALE,
     FP4_MLA_Q_GLOBAL_SCALE,
@@ -231,6 +232,25 @@ def _duplicate_tail_groups(tensor: torch.Tensor, residual_dim: int) -> torch.Ten
     return torch.cat((prefix, duplicated_tail), dim=-1)
 
 
+def _expand_qk_residual_terms(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    k_residual: torch.Tensor,
+    residual_dim: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build [Q, Q_r, Q] x [K, K, K_r] after the shared prefix."""
+    prefix_dim = k.shape[-1] - residual_dim
+    residual_groups = residual_dim // FP4_BLOCK_SIZE
+    q_tail = q[..., prefix_dim:].reshape(*q.shape[:-1], residual_groups, 2, FP4_BLOCK_SIZE)
+    q_main = q_tail[..., 0, :].reshape(*q.shape[:-1], residual_dim)
+    q_residual = q_tail[..., 1, :].reshape(*q.shape[:-1], residual_dim)
+    k_main = k[..., prefix_dim:]
+    return (
+        torch.cat((q[..., :prefix_dim], q_main, q_residual, q_main), dim=-1),
+        torch.cat((k[..., :prefix_dim], k_main, k_main, k_residual), dim=-1),
+    )
+
+
 def _build_metadata(kv_cache_manager, *, num_tokens, page_size, num_layers):
     """Build a minimal metadata namespace that satisfies the kernels' field
     expectations. Single sequence, single layer slice, no draft tokens."""
@@ -369,11 +389,12 @@ def _build_multi_seq_metadata(kv_cache_manager, *, seq_lens, page_size, num_laye
     )
 
 
-def _materialize_reference_cache(metadata, layer_idx: int, head_dim: int) -> torch.Tensor:
+def _materialize_reference_cache_storage(metadata, layer_idx: int, head_dim: int) -> torch.Tensor:
     kv_cache = metadata.kv_cache_manager.get_buffers(layer_idx).view(torch.uint8)
     sf_cache = metadata.kv_cache_manager.get_block_scale_buffers(layer_idx).view(
         torch.float8_e4m3fn
     )
+    storage_head_dim = kv_cache.shape[-1] * 2
     static_global_scale = float(_get_fp4_mla_global_scale(metadata, kv_cache.device).item())
     pages = []
     src_page_ids = metadata.paged_kv_indices[
@@ -391,8 +412,8 @@ def _materialize_reference_cache(metadata, layer_idx: int, head_dim: int) -> tor
             _dequant_fp4_swizzled(
                 fp4_page,
                 sf_page,
-                logical_dim=head_dim,
-                sf_per_token=head_dim // FP4_BLOCK_SIZE,
+                logical_dim=storage_head_dim,
+                sf_per_token=storage_head_dim // FP4_BLOCK_SIZE,
                 global_scale=(
                     float(page_global_scales[page_id].item())
                     if page_global_scales is not None
@@ -402,9 +423,25 @@ def _materialize_reference_cache(metadata, layer_idx: int, head_dim: int) -> tor
         )
     if not pages:
         return torch.empty(
-            (0, metadata.page_size, head_dim), dtype=torch.float32, device=kv_cache.device
+            (0, metadata.page_size, storage_head_dim),
+            dtype=torch.float32,
+            device=kv_cache.device,
         )
     return torch.stack(pages, dim=0)
+
+
+def _materialize_reference_cache(metadata, layer_idx: int, head_dim: int) -> torch.Tensor:
+    return _materialize_reference_cache_storage(metadata, layer_idx, head_dim)[..., :head_dim]
+
+
+def _materialize_reference_k_residual(
+    metadata,
+    layer_idx: int,
+    *,
+    head_dim: int,
+) -> torch.Tensor:
+    storage = _materialize_reference_cache_storage(metadata, layer_idx, head_dim)
+    return storage[..., head_dim : head_dim + FP4_MLA_K_RESIDUAL_DIM]
 
 
 def _build_fp4_mla_attention_decode_case(*, seq_lens, num_heads, seed, query_len_per_seq=1):
@@ -436,6 +473,16 @@ def _build_fp4_mla_attention_decode_case(*, seq_lens, num_heads, seed, query_len
     kv_cache_manager.add_dummy_requests(list(range(len(seq_lens))), seq_lens)
     kv_cache_manager.get_buffers(0).view(torch.uint8).zero_()
     kv_cache_manager.get_block_scale_buffers(0).zero_()
+    expected_storage_head_dim = head_dim + (
+        FP4_MLA_K_RESIDUAL_DIM
+        if os.environ.get(FP4_MLA_ATTENTION_BACKEND_ENV, "triton") == "triton"
+        else 0
+    )
+    assert kv_cache_manager.get_buffers(0).shape[-1] * 2 == expected_storage_head_dim
+    assert (
+        kv_cache_manager.get_block_scale_buffers(0).shape[-1]
+        == expected_storage_head_dim // FP4_BLOCK_SIZE
+    )
 
     metadata = _build_multi_seq_metadata(
         kv_cache_manager,
@@ -496,6 +543,13 @@ def _fp4_mla_attention_decode_reference(
 ):
     head_dim = kv_lora_rank + qk_rope_head_dim
     dequant_cache = _materialize_reference_cache(metadata, 0, head_dim)
+    dequant_k_residual = None
+    if os.environ.get(FP4_MLA_ATTENTION_BACKEND_ENV, "triton") == "triton":
+        dequant_k_residual = _materialize_reference_k_residual(
+            metadata,
+            0,
+            head_dim=head_dim,
+        )
     num_heads = q_nope.shape[1]
     q_full = torch.cat((q_nope, q_pe), dim=-1).reshape(-1, head_dim)
     if fp4_mla_dynamic_global_scale_enabled():
@@ -544,10 +598,25 @@ def _fp4_mla_attention_decode_reference(
             query_idx = seq_idx * query_len_per_seq + query_offset
             effective_kv_len = kv_len - (query_len_per_seq - 1 - query_offset)
             cache = full_cache[:effective_kv_len]
-            logical_k = _duplicate_tail_groups(cache.float(), FP4_MLA_Q_RESIDUAL_DIM)
             q_start = query_idx * num_heads
             q = q_dequant[q_start : q_start + num_heads]
-            probs = torch.softmax(torch.matmul(q, logical_k.transpose(0, 1)) * sm_scale, dim=-1)
+            if dequant_k_residual is None:
+                logical_q = q
+                logical_k = _duplicate_tail_groups(cache.float(), FP4_MLA_Q_RESIDUAL_DIM)
+            else:
+                full_k_residual = dequant_k_residual[indptr[seq_idx] : indptr[seq_idx + 1]].reshape(
+                    -1, FP4_MLA_K_RESIDUAL_DIM
+                )
+                logical_q, logical_k = _expand_qk_residual_terms(
+                    q,
+                    cache.float(),
+                    full_k_residual[:effective_kv_len],
+                    FP4_MLA_Q_RESIDUAL_DIM,
+                )
+            probs = torch.softmax(
+                torch.matmul(logical_q, logical_k.transpose(0, 1)) * sm_scale,
+                dim=-1,
+            )
 
             if p_dequant is None:
                 p = probs
@@ -650,7 +719,8 @@ def test_fp4_mla_kv_global_scale_uses_v_scale_pool_tail():
     v_head_dim = 512
     latent_head_dim = v_head_dim + FP4_MLA_Q_RESIDUAL_DIM
     page_size = FP4_MLA_TOKENS_PER_BLOCK
-    allocated_page_bytes = get_fp4_mla_v_scale_pool_size(latent_head_dim, page_size)
+    storage_head_dim = latent_head_dim + FP4_MLA_K_RESIDUAL_DIM
+    allocated_page_bytes = get_fp4_mla_v_scale_pool_size(storage_head_dim, page_size)
     v_scale_bytes = get_fp4_mla_v_scale_pool_size(v_head_dim, page_size)
     pool = torch.zeros((num_layers, num_pages, allocated_page_bytes), dtype=torch.uint8)
     metadata = SimpleNamespace(page_size=page_size, fp4_mla_v_scale_pool=pool)
@@ -671,7 +741,9 @@ def test_fp4_mla_v_scale_pool_view_shape():
     kv_lora_rank = 512
     page_size = FP4_MLA_TOKENS_PER_BLOCK
 
-    allocated_page_elems = get_fp4_mla_v_scale_pool_size(kv_lora_rank, page_size)
+    allocated_page_elems = get_fp4_mla_v_scale_pool_size(
+        kv_lora_rank + 2 * FP4_MLA_K_RESIDUAL_DIM, page_size
+    )
     pool = torch.empty(
         (num_layers, num_pages, allocated_page_elems),
         dtype=torch.float8_e4m3fn,
@@ -1445,7 +1517,8 @@ def test_fp4_mla_real_scatter_writes_shared_2d_scales():
         torch.cuda.synchronize()
 
         physical_page = kv_cache_manager.get_batch_cache_indices([0])[0][0]
-        sf_per_token = head_dim // FP4_BLOCK_SIZE
+        storage_head_dim = kv_cache_manager.get_buffers(0).shape[-1] * 2
+        sf_per_token = storage_head_dim // FP4_BLOCK_SIZE
         sf_per_page = page_size // FP4_BLOCK_SIZE
         k_page = (
             kv_cache_manager.get_block_scale_buffers(0)
@@ -1593,7 +1666,8 @@ def test_fp4_mla_scatter_last_page_no_oob():
         kv_cache_manager.shutdown()
 
 
-def _fp4_mla_attention_decode_residual_qk_duplicates_k_tail_impl(monkeypatch):
+def _fp4_mla_attention_decode_qk_residual_terms_impl(monkeypatch):
+    monkeypatch.setenv(FP4_MLA_ATTENTION_BACKEND_ENV, "triton")
     monkeypatch.setenv("TRTLLM_FP4_MLA_TRITON_PREPACK_V", "0")
     torch.manual_seed(6)
     device = torch.device("cuda")
@@ -1687,8 +1761,23 @@ def _fp4_mla_attention_decode_residual_qk_duplicates_k_tail_impl(monkeypatch):
         dequant_cache = _materialize_reference_cache(metadata, 0, head_dim).reshape(-1, head_dim)[
             :num_tokens
         ]
-        logical_k = _duplicate_tail_groups(dequant_cache.float(), FP4_MLA_Q_RESIDUAL_DIM)
-        ref_scores = torch.matmul(q_dequant, logical_k.transpose(0, 1)) * sm_scale
+        dequant_k_residual = _materialize_reference_k_residual(
+            metadata,
+            0,
+            head_dim=head_dim,
+        ).reshape(-1, FP4_MLA_K_RESIDUAL_DIM)[:num_tokens]
+        source_k_tail = latent[:, -FP4_MLA_K_RESIDUAL_DIM:].float()
+        main_k_tail = dequant_cache[:, -FP4_MLA_K_RESIDUAL_DIM:]
+        main_error = torch.mean(torch.abs(main_k_tail - source_k_tail))
+        residual_error = torch.mean(torch.abs(main_k_tail + dequant_k_residual - source_k_tail))
+        assert residual_error < main_error
+        logical_q, logical_k = _expand_qk_residual_terms(
+            q_dequant,
+            dequant_cache.float(),
+            dequant_k_residual,
+            FP4_MLA_Q_RESIDUAL_DIM,
+        )
+        ref_scores = torch.matmul(logical_q, logical_k.transpose(0, 1)) * sm_scale
         ref_probs = torch.softmax(ref_scores, dim=-1)
         p_dequant = _dequant_fp4_swizzled(
             metadata._fp4_mla_attention_p_buf,
@@ -1703,7 +1792,7 @@ def _fp4_mla_attention_decode_residual_qk_duplicates_k_tail_impl(monkeypatch):
             ref_probs,
             atol=8e-2,
             rtol=8e-2,
-            msg="FP4 MLA residual-Q probabilities did not match duplicated K-tail reference",
+            msg="FP4 MLA probabilities did not match Q/K residual reference",
         )
     finally:
         torch.cuda.synchronize()
@@ -1753,8 +1842,8 @@ def test_fp4_mla_dynamic_scale_linear_mtp_decode_matches_reference(monkeypatch):
 
 
 @pytest.mark.skipif(_is_pre_blackwell(), reason="requires Blackwell FP4 tensor cores")
-def test_fp4_mla_attention_decode_residual_qk_duplicates_k_tail(monkeypatch):
-    _fp4_mla_attention_decode_residual_qk_duplicates_k_tail_impl(monkeypatch)
+def test_fp4_mla_attention_decode_qk_residual_terms(monkeypatch):
+    _fp4_mla_attention_decode_qk_residual_terms_impl(monkeypatch)
 
 
 @pytest.mark.skipif(

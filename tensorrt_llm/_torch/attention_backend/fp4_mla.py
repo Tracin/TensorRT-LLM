@@ -47,6 +47,7 @@ FP4_MLA_CUTILE_GLOBAL_SCALE: float = FP4_MLA_P_GLOBAL_SCALE / (448.0 / 6.0)
 # Max finite e4m3 magnitude for FP4 MLA block-scale clamping.
 FP4_MLA_E4M3_MAX: float = 448.0
 FP4_MLA_Q_RESIDUAL_DIM: int = 64
+FP4_MLA_K_RESIDUAL_DIM: int = FP4_MLA_Q_RESIDUAL_DIM
 FP4_MLA_ATTENTION_BACKEND_ENV = "TRTLLM_FP4_MLA_ATTENTION_BACKEND"
 FP4_MLA_DYNAMIC_GLOBAL_SCALE_ENV = "TRTLLM_FP4_MLA_DYNAMIC_GLOBAL_SCALE"
 _HPUpdatePhase = Literal["all", "context", "generation"]
@@ -556,6 +557,33 @@ def _get_fp4_mla_kv_cache_tensors(
     return kv_cache, sf_cache
 
 
+def _validate_fp4_mla_kv_storage_shape(
+    kv_cache: torch.Tensor,
+    sf_cache: torch.Tensor,
+    *,
+    head_dim: int,
+    backend: str,
+) -> int:
+    """Validate the backend-specific physical KV and scale strides."""
+    residual_dim = FP4_MLA_K_RESIDUAL_DIM if backend == "triton" else 0
+    expected_storage_head_dim = head_dim + residual_dim
+    storage_head_dim = kv_cache.shape[-1] * 2
+    if storage_head_dim != expected_storage_head_dim:
+        raise RuntimeError(
+            "FP4 MLA KV cache storage head dimension does not match the selected backend: "
+            f"got {storage_head_dim}, expected {expected_storage_head_dim}. Recreate the engine "
+            f"after setting {FP4_MLA_ATTENTION_BACKEND_ENV}."
+        )
+
+    expected_scale_columns = expected_storage_head_dim // FP4_BLOCK_SIZE
+    if sf_cache.shape[-1] != expected_scale_columns:
+        raise RuntimeError(
+            "FP4 MLA KV cache scale storage does not match the contiguous data layout: "
+            f"got {sf_cache.shape[-1]} columns, expected {expected_scale_columns}."
+        )
+    return storage_head_dim
+
+
 def _prepare_dynamic_context_kv_global_scales(
     metadata: Any,
     latent_cache: torch.Tensor,
@@ -792,6 +820,8 @@ def _scatter_fp4_mla_kv_cache_2d_context(
         FP4_BLOCK=FP4_BLOCK_SIZE,
         SF_PER_TOKEN=sf_per_token,
         SF_PER_PAGE=sf_per_page,
+        K_RESIDUAL_D=FP4_MLA_K_RESIDUAL_DIM,
+        STORE_K_RESIDUAL=_fp4_mla_attention_backend() == "triton",
         KV_GLOBAL_SCALE_PER_PAGE=dynamic_global_scale,
     )
 
@@ -1076,6 +1106,8 @@ def _scatter_fp4_mla_kv_cache_2d_generation(
         FP4_BLOCK=FP4_BLOCK_SIZE,
         SF_PER_TOKEN=sf_per_token,
         SF_PER_PAGE=sf_per_page,
+        K_RESIDUAL_D=FP4_MLA_K_RESIDUAL_DIM,
+        STORE_K_RESIDUAL=_fp4_mla_attention_backend() == "triton",
         REWRITE_PAGE=dynamic_global_scale,
         KV_GLOBAL_SCALE_PER_PAGE=dynamic_global_scale,
         FUSE_ROPE_CACHE_STORE=fuse_rope_cache_store,
@@ -1152,9 +1184,16 @@ def scatter_fp4_mla_kv_cache(
 
     _validate_fp4_mla_cache_shape(metadata.page_size, head_dim)
 
+    backend = _fp4_mla_attention_backend()
     global_scale = _get_fp4_mla_global_scale(metadata, latent_cache.device)
     kv_cache, sf_cache = _get_fp4_mla_kv_cache_tensors(metadata, layer_idx)
-    sf_per_token = head_dim // FP4_BLOCK_SIZE
+    storage_head_dim = _validate_fp4_mla_kv_storage_shape(
+        kv_cache,
+        sf_cache,
+        head_dim=head_dim,
+        backend=backend,
+    )
+    sf_per_token = storage_head_dim // FP4_BLOCK_SIZE
 
     if phase not in ("context", "generation"):
         raise ValueError("FP4 MLA scatter requires phase='context' or 'generation'.")
@@ -1169,6 +1208,12 @@ def scatter_fp4_mla_kv_cache(
         )
     if v_head_dim > head_dim:
         raise ValueError(f"FP4 MLA v_head_dim={v_head_dim} cannot exceed head_dim={head_dim}.")
+    if head_dim - v_head_dim != FP4_MLA_K_RESIDUAL_DIM:
+        raise ValueError(
+            "FP4 MLA K residual quantization requires the K-only tail to match "
+            f"the {FP4_MLA_K_RESIDUAL_DIM}-channel residual, got "
+            f"head_dim={head_dim} v_head_dim={v_head_dim}."
+        )
     if v_head_dim % FP4_BLOCK_SIZE != 0:
         raise ValueError(
             f"FP4 MLA v_head_dim must be divisible by {FP4_BLOCK_SIZE}, got {v_head_dim}."
@@ -2052,16 +2097,19 @@ def _run_triton_attention_decode(
     # With prepacked V, BLOCK_V=128 avoids reloading the same P tile four times
     # and matches the cutile prepacked-V tile shape.
     block_v = _select_triton_block_v(num_queries, prefer_prepacked_v=_triton_prepack_v_enabled())
-    q_head_dim = head_dim + q_residual_dim
-    # BLOCK_K = 512 matches cutile's "nvt" backend default and aligns the K-window
-    # with the residual-Q boundary (Q_HEAD_D = 640 = 512 + 128 tail). The
-    # residual-Q TMA tail path requires Q_RESIDUAL_D == 64 and TAIL_BLOCK_K == 128.
+    q_storage_head_dim = head_dim + q_residual_dim
+    # The virtual GEMM tail evaluates QK + Q_r K + Q K_r in one reduction.
+    # Q and Q_r still occupy the 640-channel interleaved physical Q buffer;
+    # the final Q term reuses Q's main tail groups while K_r comes from the
+    # contiguous 64-channel tail of the primary paged KV cache.
+    q_head_dim = head_dim + q_residual_dim + FP4_MLA_K_RESIDUAL_DIM
+    # BLOCK_K = 512 aligns the K-window with the 512-channel non-residual prefix.
     block_k = 512
     full_block_end = (q_head_dim // block_k) * block_k
     tail_k = q_head_dim - full_block_end
     tail_block_k = 1 << (tail_k - 1).bit_length() if tail_k > 0 else block_k
-    q_sf_per_token = q_head_dim // FP4_BLOCK_SIZE
-    k_sf_per_token = head_dim // FP4_BLOCK_SIZE
+    q_sf_per_token = q_storage_head_dim // FP4_BLOCK_SIZE
+    k_sf_per_token = (head_dim + FP4_MLA_K_RESIDUAL_DIM) // FP4_BLOCK_SIZE
     sf_per_page = metadata.page_size // FP4_BLOCK_SIZE
     num_head_blocks = triton.cdiv(num_heads, block_h)
 
@@ -2185,6 +2233,9 @@ def _run_triton_attention_decode(
     # (the earlier apparent win came from a since-fixed bug that loaded a
     # constant, cacheable Q slice). Kept behind an opt-in flag for future work.
     # Shape gate shared by the grouped and MTP-fused page-stats kernels.
+    # These specializations encode the old two-term residual-Q tail. The new
+    # 192-channel three-term tail intentionally fails their 128-channel shape
+    # predicates and stays on the generic QK kernel above.
     standard_page_stats_shape = (
         use_tma_data_load
         and pack_prob_in_page_stats
@@ -2376,8 +2427,10 @@ def _run_triton_attention_decode(
             sm_scale,
             NUM_HEADS=num_heads,
             Q_HEAD_D=q_head_dim,
+            Q_STORAGE_HEAD_D=q_storage_head_dim,
             K_HEAD_D=head_dim,
             Q_RESIDUAL_D=q_residual_dim,
+            K_RESIDUAL_D=FP4_MLA_K_RESIDUAL_DIM,
             PAGE_SIZE=metadata.page_size,
             FP4_BLOCK=FP4_BLOCK_SIZE,
             Q_SF_PER_TOKEN=q_sf_per_token,
@@ -2826,12 +2879,18 @@ def run_fp4_mla_attention_decode(
     """Run MLA decode with FP4 QK and FP4 PV tensor-core matmuls.
 
     Q is supplied in its assembled ``[latent, RoPE]`` layout and quantized to
-    FP4 directly. QK reads the packed K-view cache with swizzled block scales,
-    softmax probabilities are quantized to FP4 per page, and PV repacks V
-    nibbles from the shared KV cache while reading the auxiliary V-view scale
-    pool. No BF16 dequantized KV workspace is materialized on this path.
+    FP4 directly. QK reads ``[KV-nope, K-RoPE, K-RoPE-residual]`` contiguously
+    from the primary cache with swizzled block scales. Softmax probabilities
+    are quantized to FP4 per page, and PV repacks V nibbles from the shared KV
+    cache while reading the auxiliary V-view scale pool. No BF16 dequantized
+    KV workspace is materialized on this path.
     """
     head_dim = kv_lora_rank + qk_rope_head_dim
+    if qk_rope_head_dim != FP4_MLA_K_RESIDUAL_DIM:
+        raise ValueError(
+            "FP4 MLA K residual attention requires "
+            f"qk_rope_head_dim={FP4_MLA_K_RESIDUAL_DIM}, got {qk_rope_head_dim}."
+        )
     _validate_fp4_mla_cache_shape(metadata.page_size, head_dim)
     if metadata.page_size != FP4_MLA_TOKENS_PER_BLOCK:
         raise ValueError(
@@ -2901,6 +2960,12 @@ def run_fp4_mla_attention_decode(
     q_sf = q_sf.view(torch.float8_e4m3fn)
 
     kv_cache, sf_cache = _get_fp4_mla_kv_cache_tensors(metadata, layer_idx)
+    _validate_fp4_mla_kv_storage_shape(
+        kv_cache,
+        sf_cache,
+        head_dim=head_dim,
+        backend=backend,
+    )
     sf_cache = sf_cache.view(torch.float8_e4m3fn)
 
     v_sf = get_fp4_mla_v_scale_pool_view(metadata, v_head_dim=kv_lora_rank)[local_layer].view(
