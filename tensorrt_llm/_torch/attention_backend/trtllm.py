@@ -37,7 +37,8 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from ..utils import (compute_swizzled_sf_shape, get_global_attrs,
                      get_model_extra_attrs)
-from .fp4_mla import (FP4_MLA_KV_GLOBAL_SCALE, HP_BLOCK_SIZE,
+from .fp4_mla import (FP4_MLA_CUTILE_GLOBAL_SCALE, FP4_MLA_KV_GLOBAL_SCALE,
+                      FP4_MLA_Q_GLOBAL_SCALE, HP_BLOCK_SIZE,
                       apply_fp4_mla_rope_qk,
                       fp4_mla_dynamic_global_scale_enabled,
                       get_fp4_mla_hp_block_size, scatter_fp4_mla_kv_cache)
@@ -168,6 +169,8 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     high_precision_kv_pool: Optional[torch.Tensor] = None
     fp4_mla_hp_snapshot_pool: Optional[torch.Tensor] = None
     fp4_mla_v_scale_pool: Optional[torch.Tensor] = None
+    _fp4_mla_q_global_scale: Optional[torch.Tensor] = None
+    _fp4_mla_kv_global_scale: Optional[torch.Tensor] = None
     _fp4_mla_global_scale: Optional[torch.Tensor] = None
     batch_indices: Optional[torch.Tensor] = None
     positions: Optional[torch.Tensor] = None
@@ -616,7 +619,23 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 dtype=torch.float32,
                 capture_graph=capture_graph,
             )
-            self._fp4_mla_global_scale.fill_(FP4_MLA_KV_GLOBAL_SCALE)
+            self._fp4_mla_global_scale.fill_(FP4_MLA_CUTILE_GLOBAL_SCALE)
+            self._fp4_mla_q_global_scale = self.get_empty(
+                buffers,
+                (1, ),
+                cache_name="fp4_mla_q_global_scale",
+                dtype=torch.float32,
+                capture_graph=capture_graph,
+            )
+            self._fp4_mla_q_global_scale.fill_(FP4_MLA_Q_GLOBAL_SCALE)
+            self._fp4_mla_kv_global_scale = self.get_empty(
+                buffers,
+                (1, ),
+                cache_name="fp4_mla_kv_global_scale",
+                dtype=torch.float32,
+                capture_graph=capture_graph,
+            )
+            self._fp4_mla_kv_global_scale.fill_(FP4_MLA_KV_GLOBAL_SCALE)
             self.fp4_mla_v_scale_pool = self.kv_cache_manager.get_mla_v_scale_pool(
             )
 

@@ -37,8 +37,13 @@ FP4_MLA_TOKENS_PER_BLOCK: int = 128
 FP4_MLA_DYNAMIC_HP_BLOCK_SIZE: int = FP4_MLA_TOKENS_PER_BLOCK
 FP4_MLA_SCALE_ROW_GROUP: int = 128
 FP4_MLA_SCALE_COL_GROUP: int = 4
-FP4_MLA_KV_GLOBAL_SCALE: float = 448.0 * 6.0 / 448 * 6.0
 FP4_MLA_P_GLOBAL_SCALE: float = 448.0 * 6.0
+FP4_MLA_Q_STATIC_AMAX: float = 75.0
+FP4_MLA_KV_STATIC_AMAX: float = 15.0
+FP4_MLA_Q_GLOBAL_SCALE: float = FP4_MLA_P_GLOBAL_SCALE / FP4_MLA_Q_STATIC_AMAX
+FP4_MLA_KV_GLOBAL_SCALE: float = FP4_MLA_P_GLOBAL_SCALE / FP4_MLA_KV_STATIC_AMAX
+# CuTe kernels currently use one shared Q/KV global scale.
+FP4_MLA_CUTILE_GLOBAL_SCALE: float = FP4_MLA_P_GLOBAL_SCALE / (448.0 / 6.0)
 # Max finite e4m3 magnitude for FP4 MLA block-scale clamping.
 FP4_MLA_E4M3_MAX: float = 448.0
 FP4_MLA_Q_RESIDUAL_DIM: int = 64
@@ -520,9 +525,24 @@ def get_fp4_mla_kv_global_scale_pool_view(
 
 
 def _get_fp4_mla_global_scale(metadata: Any, device: torch.device) -> torch.Tensor:
-    global_scale = getattr(metadata, "_fp4_mla_global_scale", None)
+    if _fp4_mla_attention_backend() == "cutile":
+        global_scale = getattr(metadata, "_fp4_mla_global_scale", None)
+        default_scale = FP4_MLA_CUTILE_GLOBAL_SCALE
+    else:
+        global_scale = getattr(metadata, "_fp4_mla_kv_global_scale", None)
+        default_scale = FP4_MLA_KV_GLOBAL_SCALE
     if global_scale is None:
-        global_scale = torch.ones((1,), dtype=torch.float32, device=device)
+        global_scale = torch.full((1,), default_scale, dtype=torch.float32, device=device)
+    return global_scale
+
+
+def _get_fp4_mla_q_global_scale(metadata: Any, device: torch.device) -> torch.Tensor:
+    if _fp4_mla_attention_backend() == "cutile":
+        return _get_fp4_mla_global_scale(metadata, device)
+
+    global_scale = getattr(metadata, "_fp4_mla_q_global_scale", None)
+    if global_scale is None:
+        global_scale = torch.full((1,), FP4_MLA_Q_GLOBAL_SCALE, dtype=torch.float32, device=device)
     return global_scale
 
 
@@ -2146,8 +2166,8 @@ def _run_triton_attention_decode(
     )
 
     pack_prob_in_page_stats = True
-    # Static mode shares one Q/KV scale. Dynamic mode supplies one Q scale and
-    # indexes the KV scale by physical page inside the Triton kernels.
+    # Q and KV use separate static scales. Dynamic mode replaces them with one
+    # per-tensor Q scale and per-physical-page KV scales.
     page_stats_q_gscale = q_global_scale if q_global_scale is not None else global_scale
 
     # Grouped page-stats: walk multiple pages per CTA so Q (and the TMA
@@ -2871,7 +2891,7 @@ def run_fp4_mla_attention_decode(
             q_quant_input.copy_(q_2d)
         q_global_scale = _dynamic_fp4_mla_q_scale(q_quant_input)
     else:
-        q_global_scale = global_scale
+        q_global_scale = _get_fp4_mla_q_global_scale(metadata, q.device)
     q_fp4, q_sf = torch.ops.trtllm.fp4_quantize_with_residual(
         q_quant_input,
         q_global_scale,

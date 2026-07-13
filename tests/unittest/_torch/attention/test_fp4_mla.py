@@ -14,9 +14,11 @@ from tensorrt_llm._torch.attention_backend.fmha.fp4_mla import Fp4MlaFmha
 from tensorrt_llm._torch.attention_backend.fp4_mla import (
     FP4_BLOCK_SIZE,
     FP4_MLA_ATTENTION_BACKEND_ENV,
+    FP4_MLA_CUTILE_GLOBAL_SCALE,
     FP4_MLA_DYNAMIC_GLOBAL_SCALE_ENV,
     FP4_MLA_KV_GLOBAL_SCALE,
     FP4_MLA_P_GLOBAL_SCALE,
+    FP4_MLA_Q_GLOBAL_SCALE,
     FP4_MLA_Q_RESIDUAL_DIM,
     FP4_MLA_TOKENS_PER_BLOCK,
     HP_BLOCK_SIZE,
@@ -24,6 +26,8 @@ from tensorrt_llm._torch.attention_backend.fp4_mla import (
     _dynamic_fp4_mla_q_scale,
     _fp4_mla_uniform_generation_lengths,
     _get_cutile_v_packed_cache,
+    _get_fp4_mla_global_scale,
+    _get_fp4_mla_q_global_scale,
     _maybe_update_cutile_v_packed_cache,
     _snapshot_hp_kv_for_mtp_generation,
     _validate_fp4_mla_dynamic_scale_backend,
@@ -49,7 +53,7 @@ from tensorrt_llm.quantization.mode import QuantMode
 
 _DataType = tensorrt_llm.bindings.DataType
 _CacheType = tensorrt_llm.bindings.internal.batch_manager.CacheType
-_TEST_GLOBAL_SCALE = FP4_MLA_KV_GLOBAL_SCALE
+_TEST_KV_GLOBAL_SCALE = FP4_MLA_KV_GLOBAL_SCALE
 
 
 def _fp4_mla_attn_for_availability(head_dim: int):
@@ -114,6 +118,30 @@ def test_fp4_mla_dynamic_q_scale_is_per_tensor():
     torch.testing.assert_close(
         _dynamic_fp4_mla_q_scale(torch.zeros_like(q)),
         torch.ones(1),
+    )
+
+
+def test_fp4_mla_static_global_scale_amax_targets(monkeypatch):
+    metadata = SimpleNamespace(
+        _fp4_mla_q_global_scale=torch.tensor([FP4_MLA_Q_GLOBAL_SCALE]),
+        _fp4_mla_kv_global_scale=torch.tensor([FP4_MLA_KV_GLOBAL_SCALE]),
+        _fp4_mla_global_scale=torch.tensor([FP4_MLA_CUTILE_GLOBAL_SCALE]),
+    )
+
+    monkeypatch.setenv(FP4_MLA_ATTENTION_BACKEND_ENV, "triton")
+    q_scale = _get_fp4_mla_q_global_scale(metadata, torch.device("cpu"))
+    kv_scale = _get_fp4_mla_global_scale(metadata, torch.device("cpu"))
+    assert FP4_MLA_P_GLOBAL_SCALE / q_scale.item() == pytest.approx(75.0)
+    assert FP4_MLA_P_GLOBAL_SCALE / kv_scale.item() == pytest.approx(15.0)
+
+    monkeypatch.setenv(FP4_MLA_ATTENTION_BACKEND_ENV, "cutile")
+    torch.testing.assert_close(
+        _get_fp4_mla_q_global_scale(metadata, torch.device("cpu")),
+        metadata._fp4_mla_global_scale,
+    )
+    torch.testing.assert_close(
+        _get_fp4_mla_global_scale(metadata, torch.device("cpu")),
+        metadata._fp4_mla_global_scale,
     )
 
 
@@ -231,7 +259,9 @@ def _build_metadata(kv_cache_manager, *, num_tokens, page_size, num_layers):
     kv_lens = torch.tensor([num_tokens], dtype=torch.int32, device=device)
     prompt_lens_cuda = torch.tensor([num_tokens], dtype=torch.int32, device=device)
     prompt_lens_cpu = torch.tensor([num_tokens], dtype=torch.int32)
-    global_scale = torch.tensor([_TEST_GLOBAL_SCALE], dtype=torch.float32, device=device)
+    kv_global_scale = torch.tensor([_TEST_KV_GLOBAL_SCALE], dtype=torch.float32, device=device)
+    q_global_scale = torch.tensor([FP4_MLA_Q_GLOBAL_SCALE], dtype=torch.float32, device=device)
+    global_scale = torch.tensor([FP4_MLA_CUTILE_GLOBAL_SCALE], dtype=torch.float32, device=device)
 
     return SimpleNamespace(
         kv_cache_manager=kv_cache_manager,
@@ -253,6 +283,8 @@ def _build_metadata(kv_cache_manager, *, num_tokens, page_size, num_layers):
         kv_lens_cuda_runtime=kv_lens,
         prompt_lens_cuda_runtime=prompt_lens_cuda,
         prompt_lens_cpu_runtime=prompt_lens_cpu,
+        _fp4_mla_q_global_scale=q_global_scale,
+        _fp4_mla_kv_global_scale=kv_global_scale,
         _fp4_mla_global_scale=global_scale,
         request_ids=[0],
         is_cuda_graph=False,
@@ -303,7 +335,9 @@ def _build_multi_seq_metadata(kv_cache_manager, *, seq_lens, page_size, num_laye
     kv_lens = torch.tensor(seq_lens, dtype=torch.int32, device=device)
     prompt_lens_cuda = torch.tensor(seq_lens, dtype=torch.int32, device=device)
     prompt_lens_cpu = torch.tensor(seq_lens, dtype=torch.int32)
-    global_scale = torch.tensor([_TEST_GLOBAL_SCALE], dtype=torch.float32, device=device)
+    kv_global_scale = torch.tensor([_TEST_KV_GLOBAL_SCALE], dtype=torch.float32, device=device)
+    q_global_scale = torch.tensor([FP4_MLA_Q_GLOBAL_SCALE], dtype=torch.float32, device=device)
+    global_scale = torch.tensor([FP4_MLA_CUTILE_GLOBAL_SCALE], dtype=torch.float32, device=device)
 
     return SimpleNamespace(
         kv_cache_manager=kv_cache_manager,
@@ -326,6 +360,8 @@ def _build_multi_seq_metadata(kv_cache_manager, *, seq_lens, page_size, num_laye
         kv_lens_cuda_runtime=kv_lens,
         prompt_lens_cuda_runtime=prompt_lens_cuda,
         prompt_lens_cpu_runtime=prompt_lens_cpu,
+        _fp4_mla_q_global_scale=q_global_scale,
+        _fp4_mla_kv_global_scale=kv_global_scale,
         _fp4_mla_global_scale=global_scale,
         request_ids=request_ids,
         is_cuda_graph=False,
@@ -338,6 +374,7 @@ def _materialize_reference_cache(metadata, layer_idx: int, head_dim: int) -> tor
     sf_cache = metadata.kv_cache_manager.get_block_scale_buffers(layer_idx).view(
         torch.float8_e4m3fn
     )
+    static_global_scale = float(_get_fp4_mla_global_scale(metadata, kv_cache.device).item())
     pages = []
     src_page_ids = metadata.paged_kv_indices[
         metadata.num_context_blocks : metadata.num_context_blocks + metadata.num_generation_blocks
@@ -359,7 +396,7 @@ def _materialize_reference_cache(metadata, layer_idx: int, head_dim: int) -> tor
                 global_scale=(
                     float(page_global_scales[page_id].item())
                     if page_global_scales is not None
-                    else _TEST_GLOBAL_SCALE
+                    else static_global_scale
                 ),
             )
         )
@@ -463,6 +500,8 @@ def _fp4_mla_attention_decode_reference(
     q_full = torch.cat((q_nope, q_pe), dim=-1).reshape(-1, head_dim)
     if fp4_mla_dynamic_global_scale_enabled():
         global_scale = _dynamic_fp4_mla_q_scale(q_full)
+    elif os.environ.get(FP4_MLA_ATTENTION_BACKEND_ENV, "triton") == "triton":
+        global_scale = metadata._fp4_mla_q_global_scale
     else:
         global_scale = metadata._fp4_mla_global_scale
     q_fp4, q_sf = torch.ops.trtllm.fp4_quantize_with_residual(
@@ -1633,7 +1672,7 @@ def _fp4_mla_attention_decode_residual_qk_duplicates_k_tail_impl(monkeypatch):
         q_full = q.reshape(num_heads, head_dim)
         q_fp4, q_sf = torch.ops.trtllm.fp4_quantize_with_residual(
             q_full,
-            metadata._fp4_mla_global_scale,
+            metadata._fp4_mla_q_global_scale,
             FP4_MLA_Q_RESIDUAL_DIM,
             is_act=True,
         )
@@ -1643,7 +1682,7 @@ def _fp4_mla_attention_decode_residual_qk_duplicates_k_tail_impl(monkeypatch):
             q_sf,
             logical_dim=q_logical_dim,
             sf_per_token=q_logical_dim // FP4_BLOCK_SIZE,
-            global_scale=_TEST_GLOBAL_SCALE,
+            global_scale=FP4_MLA_Q_GLOBAL_SCALE,
         )
         dequant_cache = _materialize_reference_cache(metadata, 0, head_dim).reshape(-1, head_dim)[
             :num_tokens
