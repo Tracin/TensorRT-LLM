@@ -3233,7 +3233,7 @@ def test_fp4_mla_cutedsl_4x_plan_kernel_matches_host_mirror() -> None:
             assert position == tiles
 
 
-def test_fp4_mla_cutedsl_4x_envelope_reason_static() -> None:
+def test_fp4_mla_cutedsl_4x_envelope_reason_static(monkeypatch) -> None:
     """CPU-only: the static dispatch predicate behind TRTLLM_FP4_MLA_CUTEDSL_4X."""
     from tensorrt_llm._torch.attention.backends.fp4_mla import fp4_mla_cutedsl_4x_host as host_4x
 
@@ -3295,13 +3295,20 @@ def test_fp4_mla_cutedsl_4x_envelope_reason_static() -> None:
     assert host_4x.envelope_reason_static(**{**ok, "max_kv_len": 163841}) is not None
     # CUDA-graph buckets pass the page-table capacity as max_kv_len: the split mode is capped in pair tasks there
     capacity = {**ok, "max_kv_len_is_capacity": True}
+    assert host_4x.envelope_reason_static(**capacity) is None  # 46 pairs: one wave
+    assert host_4x.envelope_reason_static(**{**capacity, "num_requests": 24}) is not None
+    assert host_4x.envelope_reason_static(**{**capacity, "num_requests": 128}) is not None
+    assert (
+        host_4x.envelope_reason_static(**{**capacity, "num_requests": 46, "query_len": 2}) is None
+    )
+    assert (
+        host_4x.envelope_reason_static(**{**capacity, "num_requests": 47, "query_len": 2})
+        is not None
+    )
+    monkeypatch.setenv(host_4x.SPLIT_MAX_PAIRS_CAPACITY_KV_ENV, "64")
     assert host_4x.envelope_reason_static(**{**capacity, "num_requests": 32}) is None  # 64 pairs
     assert host_4x.envelope_reason_static(**{**capacity, "num_requests": 33}) is not None
-    assert host_4x.envelope_reason_static(**{**capacity, "num_requests": 128}) is not None
-    assert host_4x.envelope_reason_static(**capacity) is None  # one wave: no cap
-    assert (
-        host_4x.envelope_reason_static(**{**capacity, "num_requests": 64, "query_len": 2}) is None
-    )  # 64 pairs
+    monkeypatch.delenv(host_4x.SPLIT_MAX_PAIRS_CAPACITY_KV_ENV)
     # the static FULL-only / split-mode choice
     assert not host_4x.use_split_mode(num_heads=128, query_len=4, num_requests=23, max_kv_len=30080)
     assert host_4x.use_split_mode(num_heads=128, query_len=4, num_requests=24, max_kv_len=30080)
