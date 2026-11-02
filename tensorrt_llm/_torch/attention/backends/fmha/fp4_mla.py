@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from dataclasses import replace
 from typing import TYPE_CHECKING, Optional
 
@@ -45,6 +46,35 @@ if TYPE_CHECKING:
     from tensorrt_llm._torch.attention.backends.trtllm import (
         TrtllmAttention,
         TrtllmAttentionMetadata,
+    )
+
+
+# Measurement only: dump real decode inputs of selected layers on rank 0 for the kernel benchmark
+# (eager steps only; run without CUDA graphs). TRTLLM_FP4_MLA_DUMP_DIR enables it.
+_DUMP_DIR = os.environ.get("TRTLLM_FP4_MLA_DUMP_DIR", "")
+_DUMP_LAYERS = frozenset(
+    int(x) for x in os.environ.get("TRTLLM_FP4_MLA_DUMP_LAYERS", "").split(",") if x.strip()
+)
+_DUMP_GEN_STEPS = int(os.environ.get("TRTLLM_FP4_MLA_DUMP_GEN_STEPS", "2"))
+_dump_gen_seen: dict = {}
+_dump_serial = [0]
+
+
+def _fp4_mla_dump_enabled(layer_idx: int) -> bool:
+    if not _DUMP_DIR or layer_idx not in _DUMP_LAYERS or torch.cuda.is_current_stream_capturing():
+        return False
+    from tensorrt_llm._utils import mpi_rank
+
+    return mpi_rank() == 0
+
+
+def _fp4_mla_dump(kind: str, layer_idx: int, payload: dict) -> None:
+    directory = os.path.join(_DUMP_DIR, f"layer{layer_idx:02d}")
+    os.makedirs(directory, exist_ok=True)
+    _dump_serial[0] += 1
+    torch.save(
+        {k: (v.detach().cpu() if isinstance(v, torch.Tensor) else v) for k, v in payload.items()},
+        os.path.join(directory, f"{kind}_{_dump_serial[0]:06d}.pt"),
     )
 
 
@@ -219,6 +249,19 @@ class Fp4MlaFmha(PhasedFmha):
         kv_lora_rank = attn.kv_lora_rank or 0
 
         latent_cache = forward_args.latent_cache[:num_tokens]
+        if _fp4_mla_dump_enabled(attn.layer_idx):
+            num_contexts = metadata.num_contexts
+            _fp4_mla_dump(
+                "ctx",
+                attn.layer_idx,
+                dict(
+                    latent=latent_cache,  # pre-RoPE [tokens, kv_lora_rank + rope]
+                    positions=metadata.fp4_mla_state.positions[:num_tokens],
+                    seq_lens=metadata.seq_lens[:num_contexts],
+                    request_ids=list(metadata.request_ids[:num_contexts]),
+                    rotary_cos_sin=attn.rotary_cos_sin,
+                ),
+            )
 
         def update_fp4_cache() -> None:
             hp_pool_updated = scatter_fp4_mla_kv_cache(
@@ -376,6 +419,26 @@ class Fp4MlaFmha(PhasedFmha):
         prequantized_q = getattr(metadata.fp4_mla_state, "prequantized_q", None)
         prequantized_q_sf = getattr(metadata.fp4_mla_state, "prequantized_q_sf", None)
         q_batch_capacity = getattr(metadata.fp4_mla_state, "q_batch_capacity", None)
+        if _fp4_mla_dump_enabled(attn.layer_idx):
+            num_contexts = metadata.num_contexts
+            num_gen = metadata.num_generations
+            request_ids = list(metadata.request_ids[num_contexts : num_contexts + num_gen])
+            counts = [_dump_gen_seen.get((attn.layer_idx, r), 0) for r in request_ids]
+            if any(c < _DUMP_GEN_STEPS for c in counts):
+                for r in request_ids:
+                    _dump_gen_seen[(attn.layer_idx, r)] = _dump_gen_seen.get((attn.layer_idx, r), 0) + 1
+                kv_lens = metadata.fp4_mla_state.generation_kv_lens
+                _fp4_mla_dump(
+                    "gen",
+                    attn.layer_idx,
+                    dict(
+                        q=query,  # post-RoPE [tokens, heads, kv_lora_rank + rope]
+                        kv_lens=None if kv_lens is None else kv_lens[:num_gen],
+                        request_ids=request_ids,
+                        step_counts=counts,
+                        sm_scale=sm_scale,
+                    ),
+                )
         try:
             run_fp4_mla_attention_decode(
                 metadata,
