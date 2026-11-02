@@ -1282,6 +1282,7 @@ def run_fp4_mla_attention_decode(
                 helix_kv_bounds=helix_kv_bounds,
                 softmax_stats_tensor=softmax_stats_tensor,
                 v_packed=core_v_packed,
+                max_kv_len_is_capacity=metadata.fp4_mla_state.page_table_stride_is_capacity,
             )
             _decode_4x._fp4_mla_4x_record(reason_4x, num_gen_seqs, query_len_per_seq, max_kv_len_4x)
             if reason_4x is None:

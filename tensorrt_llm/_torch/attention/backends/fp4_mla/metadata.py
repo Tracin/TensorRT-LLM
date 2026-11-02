@@ -491,6 +491,7 @@ def configure_fp4_mla_device_page_table(
     metadata.fp4_mla_state.device_page_table = False
     metadata.fp4_mla_state.device_page_table_valid = False
     metadata.fp4_mla_state.page_table_stride = 0
+    metadata.fp4_mla_state.page_table_stride_is_capacity = False
     metadata.fp4_mla_state.context_repack_max_touched_pages = 1
 
     kv_cache_manager = getattr(metadata, "kv_cache_manager", None)
@@ -552,6 +553,7 @@ def configure_fp4_mla_device_page_table(
     metadata.fp4_mla_state.hp_page_index_scale = int(page_spec.hp_page_index_scale)
 
     max_pages = max_page_capacity
+    stride_is_capacity = True
     host_kv_lens_available = (
         isinstance(kv_lens, torch.Tensor)
         and kv_lens.device.type == "cpu"
@@ -575,6 +577,7 @@ def configure_fp4_mla_device_page_table(
             max_page_capacity,
             max(1, _ceil_div(max_kv_len, FP4_MLA_TOKENS_PER_BLOCK)),
         )
+        stride_is_capacity = False
         if num_contexts > 0:
             max_context_len = int(kv_lens[:num_contexts].max().item())
             max_context_pages = _ceil_div(
@@ -612,6 +615,7 @@ def configure_fp4_mla_device_page_table(
     metadata.fp4_mla_state.device_page_table = True
     metadata.fp4_mla_state.num_sequences = num_sequences
     metadata.fp4_mla_state.page_table_stride = max_pages
+    metadata.fp4_mla_state.page_table_stride_is_capacity = stride_is_capacity
     metadata.fp4_mla_state.num_blocks = None
     metadata.fp4_mla_state.num_context_blocks = num_contexts * max_pages
     metadata.fp4_mla_state.num_generation_blocks = num_generation_sequences * max_pages

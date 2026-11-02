@@ -3293,6 +3293,15 @@ def test_fp4_mla_cutedsl_4x_envelope_reason_static() -> None:
         is not None
     )
     assert host_4x.envelope_reason_static(**{**ok, "max_kv_len": 163841}) is not None
+    # CUDA-graph buckets pass the page-table capacity as max_kv_len: the split mode is capped in pair tasks there
+    capacity = {**ok, "max_kv_len_is_capacity": True}
+    assert host_4x.envelope_reason_static(**{**capacity, "num_requests": 48}) is None  # 96 pairs
+    assert host_4x.envelope_reason_static(**{**capacity, "num_requests": 49}) is not None
+    assert host_4x.envelope_reason_static(**{**capacity, "num_requests": 128}) is not None
+    assert host_4x.envelope_reason_static(**capacity) is None  # one wave: no cap
+    assert (
+        host_4x.envelope_reason_static(**{**capacity, "num_requests": 49, "query_len": 2}) is None
+    )  # 49 pairs
     # the static FULL-only / split-mode choice
     assert not host_4x.use_split_mode(num_heads=128, query_len=4, num_requests=23, max_kv_len=30080)
     assert host_4x.use_split_mode(num_heads=128, query_len=4, num_requests=24, max_kv_len=30080)

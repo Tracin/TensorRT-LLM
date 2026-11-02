@@ -102,6 +102,13 @@ SPLIT_MIN_KV_MULTIWAVE_ENV = "TRTLLM_FP4_MLA_4X_SPLIT_MIN_KV_MULTIWAVE"
 SPLIT_MIN_KV_MULTIWAVE_DEFAULT = 8192
 SPLIT_MIN_KV_ONEWAVE_ENV = "TRTLLM_FP4_MLA_4X_SPLIT_MIN_KV_ONEWAVE"
 SPLIT_MIN_KV_ONEWAVE_DEFAULT = 65536
+# CUDA-graph buckets pass the page-table capacity as max_kv_len, so the multiwave KV floor cannot filter short KV
+# there and the split mode replays at whatever KV a step has. Measured on DeepSeek-R1 serving steps (q4, MTP3, CUDA
+# graphs, 1K-16K context): 64 pairs (B32) stay within 0.3 % of the 2x step at 1K-4K and gain 3.5-7.7 % at 8K-16K,
+# 128 pairs (B64) lose 1-2 % at 1K-2K, 256 pairs (B128) lose 3-6 % from 1K to 8K. A capacity-bound call above this
+# many pair tasks keeps the 2x path.
+SPLIT_MAX_PAIRS_CAPACITY_KV_ENV = "TRTLLM_FP4_MLA_4X_SPLIT_MAX_PAIRS_CAPACITY_KV"
+SPLIT_MAX_PAIRS_CAPACITY_KV_DEFAULT = 96
 # Under-filled single waves: the 2x packed planner cuts every request in two whenever the two-piece plan still fits
 # one wave of its 2-CTA clusters (2 x requests x m_tiles <= sm_count // 2, m_tiles = heads x q / 128 packed rows;
 # fp4_mla_packed_reduce.packed_plan_kernel), which halves its makespan while a one-wave 4x launch cannot. Measured
@@ -872,11 +879,13 @@ def envelope_reason_static(
     helix: bool = False,
     softmax_stats: bool = False,
     v_packed: bool = True,
+    max_kv_len_is_capacity: bool = False,
 ) -> str | None:
     """Dispatch predicate on STATIC shape values only (CUDA-graph buckets replay a fixed path): None when the 4x
     kernel covers the call (one-wave FULL-only launch, or the split mode for larger batches / long KV), else the
     reason it does not (the caller keeps the 2x path). Mirrors validate_envelope's shape rules without touching
-    tensors (fp4_mla/__init__.py dispatch)."""
+    tensors (fp4_mla/__init__.py dispatch). ``max_kv_len_is_capacity``: max_kv_len is the page-table capacity
+    (CUDA-graph buckets), not the batch's longest sequence."""
     if query_len not in SUPPORTED_QUERY_LENS:
         return f"query_len {query_len} not in {SUPPORTED_QUERY_LENS}"
     if num_heads <= 0 or num_heads > HEADS or (num_heads * query_len) % 256 != 0:
@@ -919,6 +928,14 @@ def envelope_reason_static(
             return (
                 f"{pairs} pairs > one wave and max_kv_len {max_kv_len} < {min_kv}: the per-task fixed cost "
                 f"of the extra waves outweighs the 4x per-tile edge ({SPLIT_MIN_KV_MULTIWAVE_ENV})"
+            )
+        max_pairs_capacity = _env_int(
+            SPLIT_MAX_PAIRS_CAPACITY_KV_ENV, SPLIT_MAX_PAIRS_CAPACITY_KV_DEFAULT
+        )
+        if max_kv_len_is_capacity and pairs > max_pairs_capacity:
+            return (
+                f"{pairs} pairs > {max_pairs_capacity} and max_kv_len {max_kv_len} is the page-table capacity: "
+                f"the split mode would also run at short KV ({SPLIT_MAX_PAIRS_CAPACITY_KV_ENV})"
             )
     return None
 

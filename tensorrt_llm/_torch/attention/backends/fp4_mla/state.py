@@ -52,6 +52,8 @@ class Fp4MlaState:
     device_page_table: bool = False
     device_page_table_valid: bool = False
     page_table_stride: int = 0
+    # True when the stride is the configured page capacity (CUDA graphs), not the batch's longest sequence.
+    page_table_stride_is_capacity: bool = False
     context_repack_max_touched_pages: int = 1
     cache_pool_id: int = 0
     cache_page_index_scale: int = 0

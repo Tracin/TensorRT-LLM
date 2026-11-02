@@ -77,6 +77,7 @@ def _fp4_mla_cutedsl_4x_reason(
     helix_kv_bounds: Optional[torch.Tensor],
     softmax_stats_tensor: Optional[torch.Tensor],
     v_packed: Optional[torch.Tensor],
+    max_kv_len_is_capacity: bool,
 ) -> Optional[str]:
     """None when the 4x kernel takes this decode call, else why it stays on the 2x path (static shapes only)."""
     from . import fp4_mla_cutedsl_4x_host as host_4x
@@ -90,6 +91,7 @@ def _fp4_mla_cutedsl_4x_reason(
         helix=helix_kv_bounds is not None,
         softmax_stats=softmax_stats_tensor is not None,
         v_packed=v_packed is not None,
+        max_kv_len_is_capacity=max_kv_len_is_capacity,
     )
 
 
