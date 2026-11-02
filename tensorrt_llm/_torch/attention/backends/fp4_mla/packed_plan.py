@@ -44,12 +44,14 @@ def _select_packed_split_count(
     *,
     max_kv_len: int,
     is_cuda_graph: bool,
+    helix: bool = False,
 ) -> int:
     """Task slots per request (grid.z = requests * splits): enough for two
-    waves of 2-CTA clusters plus one task per request, and never fewer than
-    two so a long request in a large batch can still be split (the kernel
-    shares the slots by KV length and leaves them unused when the batch is
-    even).
+    waves of 2-CTA clusters plus one task per request. Helix never gets fewer
+    than two, so a long request in a large batch can still be split (the
+    kernel shares the slots by KV length and leaves them unused when the batch
+    is even); elsewhere a batch whose two-piece plan does not fit one wave
+    keeps one task per request.
 
     The count depends only on the request count and tile count, so a CUDA
     graph bucket always replays the same geometry. Eager calls know the real
@@ -59,6 +61,13 @@ def _select_packed_split_count(
     override = os.getenv(_FP4_MLA_SPLIT_KV_ENV, "auto")
     if override != "auto":
         return max(1, min(int(override), _FP4_MLA_PACKED_MAX_SPLITS))
+    # Splitting pays where the two-piece plan fits one wave of 2-CTA clusters, which it halves. Past that an
+    # even batch keeps every request whole while the slots, partials and reducer still cost 4-12 us per call,
+    # and a partly filled single wave is cut into pieces slower than the wave itself (DeepSeek-R1, 128 heads,
+    # q4, CUDA graphs, per call: B128 4K 106.9 us whole vs 117.8 us with the split budget, B16 4K 25.7 vs 42.6).
+    # Helix keeps the budget: its per-rank KV slices are skewed.
+    if not helix and 2 * num_requests * m_tiles > max(1, _get_sm_count(device) // 2):
+        return 1
     # Slots for two waves of tasks (the plan's finest target) plus one rounding
     # task per request, so the target share fits whenever the batch is skewed.
     wave_tasks = _packed_wave_tasks(device, m_tiles)
@@ -167,6 +176,7 @@ def _fp4_mla_packed_plan_geometry(
         device,
         max_kv_len=max_kv_len,
         is_cuda_graph=is_cuda_graph,
+        helix=bool(getattr(metadata, "enable_helix", False)),
     )
     # Tasks that fill one wave of 2-CTA clusters: the plan's task-length reference.
     wave_tasks = _packed_wave_tasks(device, m_tiles)
