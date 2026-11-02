@@ -104,11 +104,11 @@ SPLIT_MIN_KV_ONEWAVE_ENV = "TRTLLM_FP4_MLA_4X_SPLIT_MIN_KV_ONEWAVE"
 SPLIT_MIN_KV_ONEWAVE_DEFAULT = 65536
 # CUDA-graph buckets pass the page-table capacity as max_kv_len, so the multiwave KV floor cannot filter short KV
 # there and the split mode replays at whatever KV a step has. Measured on DeepSeek-R1 serving steps (q4, MTP3, CUDA
-# graphs, 1K-16K context): 64 pairs (B32) stay within 0.3 % of the 2x step at 1K-4K and gain 3.5-7.7 % at 8K-16K,
-# 128 pairs (B64) lose 1-2 % at 1K-2K, 256 pairs (B128) lose 3-6 % from 1K to 8K. A capacity-bound call above this
-# many pair tasks keeps the 2x path.
+# graphs, 1K-16K context): 64 pairs (B32) stay within 1.2 % of the 2x step at 1K-4K and gain 2.8-7.7 % at 8K-16K,
+# 96 pairs (B48) lose 2-5 % from 1K to 8K and break even at 16K, 256 pairs (B128) lose 3-6 % from 1K to 8K. A
+# capacity-bound call above this many pair tasks keeps the 2x path.
 SPLIT_MAX_PAIRS_CAPACITY_KV_ENV = "TRTLLM_FP4_MLA_4X_SPLIT_MAX_PAIRS_CAPACITY_KV"
-SPLIT_MAX_PAIRS_CAPACITY_KV_DEFAULT = 96
+SPLIT_MAX_PAIRS_CAPACITY_KV_DEFAULT = 64
 # Under-filled single waves: the 2x packed planner cuts every request in two whenever the two-piece plan still fits
 # one wave of its 2-CTA clusters (2 x requests x m_tiles <= sm_count // 2, m_tiles = heads x q / 128 packed rows;
 # fp4_mla_packed_reduce.packed_plan_kernel), which halves its makespan while a one-wave 4x launch cannot. Measured
