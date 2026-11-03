@@ -37,13 +37,15 @@ Environment:
                                     two-stream path still needs the static envelope; ``twostream`` falls back to ``4x``
                                     when the planner finds no useful split).
 ``TRTLLM_FP4_MLA_4X_MIN_KV``        KV length (tokens) below which the call stays on ``2x`` (default 12288).
+``TRTLLM_FP4_MLA_KV_REGIME_GRID``   KV regime ceilings (tokens, comma-separated) a graph runner keys its decode
+                                    graphs by above that floor (default ``4096,8192,12288,16384,32768,65536``;
+                                    ``0`` keeps only the 2x regime and the capacity): see ``kv_regimes_for_graphs``.
 """
 
 from __future__ import annotations
 
-import math
 import os
-from typing import Callable, NamedTuple, Optional
+from typing import Callable, NamedTuple, Optional, Sequence
 
 from .fp4_mla_twostream import TwoStreamPlan, plan_two_stream
 
@@ -56,8 +58,10 @@ PATH_4X = "4x"
 PATH_TWO_STREAM = "twostream"
 PATHS = (PATH_2X, PATH_4X, PATH_TWO_STREAM)
 
-# KV regime ceilings a graph runner can key its decode graphs by (tokens).  ``kv_regime_ceiling`` maps a step's
-# longest live KV to the smallest ceiling that covers it; the capacity itself is the last regime.
+# KV regime ceilings a graph runner can key its decode graphs by (tokens): ``kv_regimes_for_graphs`` picks the regimes
+# worth a graph family, ``kv_regime_for_step`` maps a step's longest live KV onto them (``kv_regime_ceiling`` onto the
+# bare grid); the page-table capacity itself is always the last regime.
+KV_REGIME_GRID_ENV = "TRTLLM_FP4_MLA_KV_REGIME_GRID"
 KV_REGIME_CEILINGS = (4096, 8192, 12288, 16384, 32768, 65536)
 
 
@@ -107,6 +111,48 @@ def kv_regime_ceiling(max_kv_len: int, capacity: int) -> int:
     return int(capacity)
 
 
+def kv_regime_grid() -> tuple[int, ...]:
+    """Regime ceilings above the floor: ``KV_REGIME_CEILINGS`` unless ``TRTLLM_FP4_MLA_KV_REGIME_GRID`` lists others."""
+    value = os.getenv(KV_REGIME_GRID_ENV)
+    if value is None or value.strip() == "":
+        return KV_REGIME_CEILINGS
+    try:
+        ceilings = sorted({int(item) for item in value.split(",") if item.strip() != ""})
+    except ValueError:
+        return KV_REGIME_CEILINGS
+    return tuple(ceiling for ceiling in ceilings if ceiling > 0)
+
+
+def kv_regimes_for_graphs(capacity: int) -> tuple[int, ...]:
+    """Ceilings of the KV regimes a graph runner captures one decode-graph family for (ascending, capacity last).
+
+    Only regimes the decision can tell apart earn a family: one for every step under ``min_kv_4x()``, whose ceiling is
+    the last KV length the dispatcher still routes to 2x (so its graph decides the way the eager call would for each of
+    those steps), every grid point above the floor and below the capacity (the two-stream plan moves with the KV
+    length), and the capacity itself.  A forced ``TRTLLM_FP4_MLA_DECODE_PATH`` of ``2x`` or ``4x`` never looks at the
+    KV length, nor does a capacity under the floor: a single regime.  Reads the environment once, at warm-up.
+    """
+    capacity = int(capacity)
+    floor = min_kv_4x()
+    if _env_path() in (PATH_2X, PATH_4X) or capacity < floor:
+        return (capacity,)
+    ceilings = [floor - 1] if floor > 1 else []
+    ceilings += [ceiling for ceiling in kv_regime_grid() if floor < ceiling < capacity]
+    return tuple(ceilings) + (capacity,)
+
+
+def kv_regime_for_step(max_kv_len: int, ceilings: Sequence[int]) -> int:
+    """Regime of a step whose longest live KV is ``max_kv_len``: the smallest ceiling covering it.
+
+    Shorter steps share the first regime; a step beyond the list (never, when ``ceilings`` ends with the
+    capacity) gets the last one, the graph of the capacity.
+    """
+    for ceiling in ceilings:
+        if max_kv_len <= ceiling:
+            return int(ceiling)
+    return int(ceilings[-1])
+
+
 def choose_decode_strategy(
     *,
     num_requests: int,
@@ -141,9 +187,13 @@ def choose_decode_strategy(
     if not four_x_enabled:
         return two_x("TRTLLM_FP4_MLA_CUTEDSL_4X=0")
     if forced == PATH_2X:
-        return DecodeStrategy(PATH_2X, 0, f"forced by {DECODE_PATH_ENV}", kv_decision, "forced", None)
+        return DecodeStrategy(
+            PATH_2X, 0, f"forced by {DECODE_PATH_ENV}", kv_decision, "forced", None
+        )
     if forced == "auto" and kv_decision < min_kv_4x():
-        return two_x(f"KV {kv_decision} < {min_kv_4x()}: the 2x packed kernel has the lower fixed cost ({MIN_KV_4X_ENV})")
+        return two_x(
+            f"KV {kv_decision} < {min_kv_4x()}: the 2x packed kernel has the lower fixed cost ({MIN_KV_4X_ENV})"
+        )
     reason = envelope_reason(
         num_heads=num_heads,
         query_len=query_len,
@@ -157,7 +207,9 @@ def choose_decode_strategy(
     if reason is not None:
         return two_x(reason)
     if forced == PATH_4X:
-        return DecodeStrategy(PATH_4X, 0, f"forced by {DECODE_PATH_ENV}", kv_decision, "forced", None)
+        return DecodeStrategy(
+            PATH_4X, 0, f"forced by {DECODE_PATH_ENV}", kv_decision, "forced", None
+        )
     plan = plan_two_stream(
         num_requests=num_requests,
         rows_per_request=rows_per_seq,
@@ -176,10 +228,27 @@ def choose_decode_strategy(
             v_packed=True,
         )
         if prefix_reason is not None:
-            plan = plan._replace(r2=0, reason=f"4x prefix of {plan.num_requests_4x} requests outside the envelope: {prefix_reason}")
+            plan = plan._replace(
+                r2=0,
+                reason=f"4x prefix of {plan.num_requests_4x} requests outside the envelope: {prefix_reason}",
+            )
     if plan.enabled:
-        return DecodeStrategy(PATH_TWO_STREAM, plan.r2, plan.reason, kv_decision, kv_source if forced == "auto" else "forced", plan)
-    return DecodeStrategy(PATH_4X, 0, plan.reason if forced == "auto" else f"forced {forced}; {plan.reason}", kv_decision, kv_source if forced == "auto" else "forced", plan)
+        return DecodeStrategy(
+            PATH_TWO_STREAM,
+            plan.r2,
+            plan.reason,
+            kv_decision,
+            kv_source if forced == "auto" else "forced",
+            plan,
+        )
+    return DecodeStrategy(
+        PATH_4X,
+        0,
+        plan.reason if forced == "auto" else f"forced {forced}; {plan.reason}",
+        kv_decision,
+        kv_source if forced == "auto" else "forced",
+        plan,
+    )
 
 
 def describe(strategy: DecodeStrategy) -> str:

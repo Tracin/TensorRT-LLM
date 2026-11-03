@@ -16,6 +16,7 @@ from _torch.executor.engine_test_utils import _create_request_with_tokens, _make
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDAGraphRunner
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.graphs import (
     DecoderCudaGraphs,
+    _kv_regime_length_passes,
     _make_single_token_context_graph_batch,
 )
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner import DecoderRunner
@@ -359,6 +360,107 @@ def test_generation_capture_passes_local_speculation_state(fails: bool) -> None:
         )
     assert forward_warmup.call_args_list == expected_calls
     assert runner.force_lora_graph_for_capture is None
+
+
+@pytest.mark.cpu_only
+def test_generation_capture_runs_one_pass_per_kv_regime() -> None:
+    runner = decoder_graphs(
+        decoder_config(max_seq_len=20000),
+        cuda_graph_runner=Mock(enabled=True, is_warmup_only=False),
+    )
+    resource_manager = Mock()
+    warmup_lengths = []
+
+    def create_request(
+        resources: ResourceManager,
+        batch_size: int,
+        draft_len: int,
+        max_seq_len: int,
+        **kwargs: object,
+    ) -> ScheduledRequests:
+        warmup_lengths.append(max_seq_len)
+        return ScheduledRequests()
+
+    with (
+        patch.object(runner, "_resolve_kv_regime_ceilings", return_value=(8192, 16384, 20096)),
+        patch.object(runner, "_get_graphs_to_capture", return_value=[(1, 0)]),
+        patch.object(
+            runner._dummy_requests, "create_cuda_graph_warmup_request", side_effect=create_request
+        ),
+        patch.object(
+            runner._dummy_requests,
+            "release_batch_context",
+            side_effect=lambda request, resources: contextlib.nullcontext(request),
+        ),
+        patch.object(runner, "_forward_warmup", Mock()),
+        patch.object(torch.cuda, "synchronize"),
+    ):
+        runner._capture_generation_cuda_graphs(resource_manager)
+
+    graph_runner = runner.cuda_graph_runner
+    graph_runner.set_kv_regime_ceilings.assert_called_once_with((8192, 16384, 20096))
+    # one pass per regime, largest first; the warmup request never exceeds the engine's max_seq_len
+    assert warmup_lengths == [20000, 16384, 8192]
+    pinned = [c.args[0] for c in graph_runner.set_capture_kv_regime.call_args_list]
+    assert pinned == [20096, 16384, 8192, None]
+
+
+@pytest.mark.cpu_only
+def test_kv_regime_length_passes_cover_every_family_a_step_can_key() -> None:
+    # one warm-up length: every regime below it and the one covering it, largest first
+    assert _kv_regime_length_passes([30080], (12287, 16384, 30080)) == [
+        (30080, 30080),
+        (16384, 16384),
+        (12287, 12287),
+    ]
+    # an engine max_seq_len under a ceiling captures that regime at max_seq_len and nothing above it
+    assert _kv_regime_length_passes([20000], (12287, 16384, 32768, 65536)) == [
+        (20000, 32768),
+        (16384, 16384),
+        (12287, 12287),
+    ]
+    # a sparse short/long split adds the short family in the regime covering the short length only
+    assert _kv_regime_length_passes([30080, 2044], (12287, 16384, 30080)) == [
+        (30080, 30080),
+        (16384, 16384),
+        (12287, 12287),
+        (2044, 12287),
+    ]
+
+
+@pytest.mark.cpu_only
+def test_kv_regime_ceilings_resolve_only_for_the_fp4_mla_4x_decode() -> None:
+    runner = decoder_graphs(decoder_config())
+    fp4_kv_cache_manager = Mock(spec=["max_blocks_per_seq", "get_fp4_mla_page_table_spec"])
+    fp4_kv_cache_manager.max_blocks_per_seq = 235
+    resource_manager = Mock()
+    resource_manager.get_resource_manager.return_value = fp4_kv_cache_manager
+    config_module = "tensorrt_llm._torch.attention.backends.fp4_mla.config"
+
+    # the default (4x off) resolves nothing and never looks at the KV cache
+    with patch(f"{config_module}._fp4_mla_cutedsl_4x_enabled", return_value=False):
+        assert runner._resolve_kv_regime_ceilings(resource_manager) is None
+    resource_manager.get_resource_manager.assert_not_called()
+
+    with (
+        patch(f"{config_module}._fp4_mla_cutedsl_4x_enabled", return_value=True),
+        patch(f"{config_module}._fp4_mla_packed_q_enabled", return_value=True),
+    ):
+        # capacity = blocks per sequence x 128 tokens, regimes from the default 12288 floor
+        assert runner._resolve_kv_regime_ceilings(resource_manager) == (12287, 16384, 30080)
+        # a KV cache without the FP4 MLA page table carries no fp4_mla_state: no regimes
+        resource_manager.get_resource_manager.return_value = Mock(spec=["max_blocks_per_seq"])
+        assert runner._resolve_kv_regime_ceilings(resource_manager) is None
+        # Helix decodes on the 2x kernel: no regimes
+        resource_manager.get_resource_manager.return_value = fp4_kv_cache_manager
+        with patch.object(runner.mapping, "has_cp_helix", return_value=True):
+            assert runner._resolve_kv_regime_ceilings(resource_manager) is None
+    # the dispatcher runs only behind the packed-Q cutedsl decode
+    with (
+        patch(f"{config_module}._fp4_mla_cutedsl_4x_enabled", return_value=True),
+        patch(f"{config_module}._fp4_mla_packed_q_enabled", return_value=False),
+    ):
+        assert runner._resolve_kv_regime_ceilings(resource_manager) is None
 
 
 @pytest.mark.cpu_only

@@ -117,6 +117,28 @@ def _make_single_token_context_graph_batch(
     return graph_batch, promoted_context_request_ids
 
 
+def _kv_regime_length_passes(
+    max_seq_len_list: list[int], kv_regime_ceilings: tuple[int, ...]
+) -> list[tuple[int, int]]:
+    """(warm-up length, KV regime) of every generation graph family a step can key, largest first.
+
+    For each warm-up length (the engine's maximum, plus the sparse short length when the
+    sparse attention keeps short and long graph families apart) a step can land in every
+    regime whose ceiling lies below that length and in the regime covering the length
+    itself. The warm-up request's longest row fills the regime, so the dispatcher decision
+    a graph captures is the one of its regime.
+    """
+    from tensorrt_llm._torch.attention.backends.fp4_mla import fp4_mla_dispatch
+
+    passes: set[tuple[int, int]] = set()
+    for max_seq_len in max_seq_len_list:
+        passes.update((ceiling, ceiling) for ceiling in kv_regime_ceilings if ceiling < max_seq_len)
+        passes.add(
+            (max_seq_len, fp4_mla_dispatch.kv_regime_for_step(max_seq_len, kv_regime_ceilings))
+        )
+    return sorted(passes, reverse=True)
+
+
 def compute_dynamic_draft_len_mapping(config: DecoderRunnerConfig) -> dict[int, int] | None:
     """Compute graph_bs → draft_len mapping for dynamic draft length feature.
 
@@ -726,6 +748,38 @@ class DecoderCudaGraphs:
         if not is_warmup_only:
             self._capture_prefill_cuda_graphs(resource_manager)
 
+    def _resolve_kv_regime_ceilings(
+        self, resource_manager: ResourceManager
+    ) -> tuple[int, ...] | None:
+        """KV regimes the decode graphs are keyed by; None for every backend but FP4 MLA 4x.
+
+        The FP4 MLA decode dispatcher (``fp4_mla_dispatch``) then decides on the
+        regime ceiling, the step's longest live KV rounded up, instead of the
+        page-table capacity. Resolved at capture, once the KV cache exists.
+        """
+        from tensorrt_llm._torch.attention.backends.fp4_mla import fp4_mla_dispatch
+        from tensorrt_llm._torch.attention.backends.fp4_mla.config import (
+            FP4_MLA_TOKENS_PER_BLOCK,
+            _fp4_mla_cutedsl_4x_enabled,
+            _fp4_mla_packed_q_enabled,
+        )
+
+        # Environment gates first: the default (4x off) touches nothing else. The
+        # dispatcher runs only for the packed-Q cutedsl decode and keeps Helix on
+        # the 2x kernel, so regimes would only multiply those graphs.
+        if not (_fp4_mla_cutedsl_4x_enabled() and _fp4_mla_packed_q_enabled()):
+            return None
+        if self.mapping.has_cp_helix():
+            return None
+        kv_cache_manager = resource_manager.get_resource_manager(
+            ResourceManagerType.KV_CACHE_MANAGER
+        )
+        # The predicate under which the attention metadata carries an fp4_mla_state.
+        if not callable(getattr(kv_cache_manager, "get_fp4_mla_page_table_spec", None)):
+            return None
+        capacity = int(kv_cache_manager.max_blocks_per_seq) * FP4_MLA_TOKENS_PER_BLOCK
+        return fp4_mla_dispatch.kv_regimes_for_graphs(capacity)
+
     def _capture_generation_cuda_graphs(self, resource_manager: ResourceManager) -> None:
         """Warm up or capture pure-generation CUDA graph shapes."""
         if not self.cuda_graph_runner.enabled:
@@ -771,6 +825,13 @@ class DecoderCudaGraphs:
         else:
             max_seq_len_list = [effective_max_seq_len]
 
+        kv_regime_ceilings = self._resolve_kv_regime_ceilings(resource_manager)
+        self.cuda_graph_runner.set_kv_regime_ceilings(kv_regime_ceilings)
+        if kv_regime_ceilings is None:
+            length_passes = [(max_seq_len, None) for max_seq_len in max_seq_len_list]
+        else:
+            length_passes = _kv_regime_length_passes(max_seq_len_list, kv_regime_ceilings)
+
         def _run_capture_pass(
             force_non_greedy: bool,
             label: str,
@@ -793,7 +854,8 @@ class DecoderCudaGraphs:
                     if bs > self._config.max_batch_size:
                         continue
 
-                    for max_seq_len in max_seq_len_list:
+                    for max_seq_len, kv_regime in length_passes:
+                        self.cuda_graph_runner.set_capture_kv_regime(kv_regime)
                         warmup_request = self._dummy_requests.create_cuda_graph_warmup_request(
                             resource_manager,
                             bs,
@@ -821,6 +883,7 @@ class DecoderCudaGraphs:
                                 f"Run generation-only CUDA graph {operation} ({label}) "
                                 f"for batch size={bs}, draft_len={draft_len}, "
                                 f"max_seq_len={max_seq_len}"
+                                + (f", kv_regime={kv_regime}" if kv_regime is not None else "")
                             )
                             enable_spec_decode = draft_len > 0 or (
                                 self._config.spec_config is not None
@@ -847,6 +910,7 @@ class DecoderCudaGraphs:
             finally:
                 self._force_lora_graph_for_capture = None
                 self.cuda_graph_runner.set_capture_sample_type(None)
+                self.cuda_graph_runner.set_capture_kv_regime(None)
                 if self._inputs is not None and self._inputs._dspark_confidence_enabled:
                     self.cuda_graph_runner.agreed_ragged_bucket = None
 
