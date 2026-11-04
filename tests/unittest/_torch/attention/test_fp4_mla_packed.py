@@ -48,14 +48,23 @@ def test_packed_split_count_fills_one_cluster_wave(monkeypatch) -> None:
     device = torch.device("cuda")
     select = fp4_mla_packed_plan._select_packed_split_count
     # helix16 B4 MTP7 (6 m-tiles): two waves = 34 tasks / 4 requests + 1 rounding slot -> 10.
-    assert select(4, 6, device, max_kv_len=999424, is_cuda_graph=True) == 10
+    assert select(4, 6, device, max_kv_len=999424, is_cuda_graph=True, helix=True) == 10
     # A single short request is capped by the KV length when it is known.
-    assert select(1, 6, device, max_kv_len=512, is_cuda_graph=False) == 1
-    assert select(1, 6, device, max_kv_len=999424, is_cuda_graph=True) == 16
-    # Large batches keep a two-slot budget so one long request can still split.
-    assert select(32, 6, device, max_kv_len=999424, is_cuda_graph=True) == 3
+    assert select(1, 6, device, max_kv_len=512, is_cuda_graph=False, helix=True) == 1
+    assert select(1, 6, device, max_kv_len=999424, is_cuda_graph=True, helix=True) == 16
+    # Large Helix batches keep a two-slot budget so one long request can still split.
+    assert select(32, 6, device, max_kv_len=999424, is_cuda_graph=True, helix=True) == 3
+    # Elsewhere only batches whose two-piece plan fits one wave of 106 clusters split.
+    assert select(4, 6, device, max_kv_len=999424, is_cuda_graph=True) == 10
+    assert select(32, 6, device, max_kv_len=999424, is_cuda_graph=True) == 1
+    assert select(13, 4, device, max_kv_len=34816, is_cuda_graph=True) == 5  # 2 x 13 x 4 = 104
+    assert select(14, 4, device, max_kv_len=34816, is_cuda_graph=True) == 1  # 2 x 14 x 4 = 112
+    assert select(128, 4, device, max_kv_len=34816, is_cuda_graph=False) == 1
+    assert select(53, 1, device, max_kv_len=34816, is_cuda_graph=True) == 5
+    assert select(54, 1, device, max_kv_len=34816, is_cuda_graph=True) == 1
     monkeypatch.setenv("TRTLLM_FP4_MLA_SPLIT_KV", "3")
     assert select(4, 6, device, max_kv_len=999424, is_cuda_graph=True) == 3
+    assert select(128, 4, device, max_kv_len=34816, is_cuda_graph=True) == 3
 
 
 def _plan_mod():
